@@ -7,7 +7,7 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 
 # Initialize OpenAI client
-os.environ["DEEPSEEK_API_KEY"] = "sk-9ab066c6342748bdba3552ed8a9776e5"
+os.environ["DEEPSEEK_API_KEY"] = ""
 client = OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
 
 prompt = """You are an expert neuroscientist tasked with rewriting fMRI brain {descriptor_type} descriptions to be more diverse and natural while maintaining scientific accuracy.
