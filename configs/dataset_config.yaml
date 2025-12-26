@@ -1,0 +1,26 @@
+datasets:
+  UKB:
+    targets:
+      - sex
+      # - fluidintel_enc
+      # - age
+      # - fluidintel
+  HCP:
+    targets:
+      - sex
+  #     - age
+      # - fluidcomp_enc
+  HCP_Aging:
+    targets:
+      - sex
+      # - fluidcomp_enc
+      # - flanker
+  ADNI:
+    targets:
+      - AD
+  ABIDE2:
+    targets:
+      - ASD
+  ADHD200:
+    targets:
+      - ADHD

@@ -1,0 +1,26 @@
+datasets:
+  UKB:
+    targets:
+      - sex
+      - fluidintel_enc
+    is_multi: true
+  # HCP_Aging:
+  #   targets:
+  #     - sex
+  #     - flanker_enc
+  #     - fluidcomp_enc
+  #   is_multi: true
+  ADNI:
+    targets:
+      - sex
+      - AD
+      # - av45_enc
+      - apoe4_enc
+    is_multi: true
+  # ADHD200:
+  #   targets:
+  #     - sex
+  #     - VIQ_enc
+  #     - PIQ_enc
+  #     - ADHD
+  #   is_multi: true

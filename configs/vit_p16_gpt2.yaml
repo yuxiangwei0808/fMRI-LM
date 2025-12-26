@@ -1,0 +1,15 @@
+model:
+  vq_model:
+      patch_size: 16
+      n_embd: 384
+      in_chans: 1
+      num_rois: 450
+      num_timestamp: 180
+      enc_cls: vit_small
+    
+  lm:
+      base_model: gpt2
+      num_fmri_tokens: 2250
+      fmri_vocab_size: 8192
+      dropout: 0.0
+      num_rois: 450

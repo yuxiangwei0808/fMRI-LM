@@ -1,0 +1,25 @@
+model:
+  vq_model:
+      patch_size: 32
+      n_embd: 384
+      in_chans: 1
+      num_rois: 450
+      num_timestamp: 160
+      enc_cls: vit_small
+      attn_mode: normal
+      drop_path_rate: 0.1
+
+      add_cls_token: false
+    
+  lm:
+      base_model: gpt2
+      num_fmri_tokens: 2250
+      fmri_vocab_size: 8192  # for vq
+      dropout: 0.0
+      num_rois: 450
+      use_fmri_lm_head: true  # use a seperate head for fMRI LM loss
+      add_fmri_delimiter: false # add fmri_start and fmri_end to the input sequence
+
+      # instruction tuning
+      peft_tune: false
+      use_cls_head: false
