@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 
-from model_mindlm import MindLM
+from model_fmrilm import fMRILM
 from quantizers import *
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data_inst

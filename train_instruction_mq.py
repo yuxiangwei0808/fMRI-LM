@@ -21,7 +21,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from model_mindlm import MindLM
+from model_fmrilm import fMRILM
 from quantizers import *
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data_inst
@@ -447,7 +447,7 @@ def main(args):
                         logger.warning(f"Could not load best metrics: {e}")
             
             gptconf = MultimodalConfig(**model_args)
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
 
             state_dict = checkpoint['model']
             unwanted_prefix = '_orig_mod.'
@@ -472,7 +472,7 @@ def main(args):
             temp_peft_flag = gptconf.peft_tune
             gptconf.peft_tune = False
 
-            model = MindLM(gptconf, tokenizer_encoder, False, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, False, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
 
             state_dict = checkpoint['model']
             unwanted_prefix = '_orig_mod.'
@@ -525,7 +525,7 @@ def main(args):
                 assert msg.missing_keys == []
             
             tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
 
             start_epoch = 0
             logger.info("Model tokenizer initialized from checkpoint")
@@ -533,7 +533,7 @@ def main(args):
             logger.info("Training from scratch (with pretrained LLM)")
             gptconf = MultimodalConfig(**model_args)
 
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
             start_epoch = 0
             logger.info("Model created from scratch")
     except Exception as e:

@@ -6,12 +6,20 @@
 import math
 from functools import partial
 import numpy as np
+from torch.autograd import Function                   
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
-from flash_attn import flash_attn_qkvpacked_func
+try:
+    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_varlen_func
+    HAS_FLASH_ATTENTION = True
+except ImportError:
+    HAS_FLASH_ATTENTION = False
 from .patch_embed import PatchEmbed
 
 
@@ -60,70 +68,6 @@ def apply_masks(x, masks):
         all_x += [torch.gather(x, dim=1, index=mask_keep)]
     return torch.cat(all_x, dim=0)
 
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size[0], dtype=float)
-    grid_w = np.arange(grid_size[1], dtype=float)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size[0], grid_size[1]])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid length
-    return:
-    pos_embed: [grid_size, embed_dim] or [1+grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid = np.arange(grid_size, dtype=float)
-    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=float)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega   # (D/2,)
-
-    pos = pos.reshape(-1)   # (M,)
-    out = np.einsum('m,d->md', pos, omega)   # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
-
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
         return x
@@ -164,72 +108,213 @@ class MLP(nn.Module):
         x = self.drop(x)
         return x
 
+class LayerScale(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            init_values: float = 1e-5,
+            inplace: bool = False,
+    ) -> None:
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
+    
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., attn_mode='normal'):
+    def __init__(self, dim, 
+                 num_heads=8, 
+                 qkv_bias=False, 
+                 qk_scale=None,
+                 qk_norm=False,
+                 proj_bias=True,
+                 attn_drop=0.,
+                 proj_drop=0., 
+                 attn_mode='normal',
+                 is_causal=False,
+                 gate_attention='none'):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        self.scale = qk_scale or self.head_dim ** -0.5
+        self.gate_attention = gate_attention
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_aug_dim = 0
+        if gate_attention == 'headwise':
+            self.q_aug_dim = self.num_heads
+        elif gate_attention == 'elementwise':
+            self.q_aug_dim = dim
+        total_dim = dim * 3 + self.q_aug_dim
+
+        self.qkv = nn.Linear(dim, total_dim, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         self.proj_drop_rate = proj_drop
-        
+        self.is_causal = is_causal
         self.attn_mode = attn_mode
 
-    def forward(self, x, return_attn=None):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        self.q_norm = nn.LayerNorm(self.head_dim, eps=1e-12) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-12) if qk_norm else nn.Identity()
+
+    def forward(self, x, return_attn=None, cu_seqlens=None, max_seqlen=None):
+        if torch.isnan(x).any():
+             print("!!! [Attention Input] x contains NaN!")
+
+        is_packed = x.ndim == 2  # (Total, C) packed input
+        if is_packed:
+            Total, C = x.shape
+            B, N = 1, Total
+        else:
+            B, N, C = x.shape
+        attn = None
+        qkv = self.qkv(x)
+
+        # Keep Q, K, V aligned; place gate projection at the end to avoid misaligned offsets for flash-attn
+        q, k, v, gate = torch.split(qkv, [self.dim, self.dim, self.dim, self.q_aug_dim], dim=-1)
+        if self.gate_attention == 'headwise' and self.q_aug_dim > 0:
+            # Gate: (..., num_heads) -> (..., num_heads, 1)
+            gate = gate.view(*gate.shape[:-1], self.num_heads, 1)
+        elif self.gate_attention == 'elementwise' and self.q_aug_dim > 0:
+            # Gate: (..., dim) -> (..., num_heads, head_dim)
+            gate = gate.view(*gate.shape[:-1], self.num_heads, self.head_dim)
+        else:
+            gate = None
+
+        # Ensure contiguous buffers before feeding flash-attn kernels
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        if gate is not None:
+            gate = gate.contiguous()
+
         if self.attn_mode == 'normal':
-            qkv = qkv.permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+            q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            k = k.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = v.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
+            q, k = self.q_norm(q), self.k_norm(k)
 
-            x = (attn @ v).transpose(1, 2)
-        elif self.attn_mode == 'flash_attn':
-            # Ensure qkv is in fp16 or bf16 for FlashAttention
-            if qkv.dtype not in [torch.float16, torch.bfloat16]:
-                qkv = qkv.half()  # Convert to fp16
-            x = flash_attn_qkvpacked_func(qkv, dropout_p=self.proj_drop_rate)
+            if self.is_causal:
+                q_len, k_len = q.size(-2), k.size(-2)
+                causal_mask = torch.triu(
+                    torch.full((q_len, k_len), float("-inf"), device=q.device),
+                    diagonal=1,
+                ).to(q.dtype)
+            out = F.scaled_dot_product_attention(q, k, v,
+                attn_mask=causal_mask if self.is_causal else None,
+                dropout_p=self.attn_drop.p if self.training else 0.0
+            )
+            out = out.transpose(1, 2)  # B, N, H, D
+
+            if gate is not None:
+                # Gate: (B, N, H, 1) or (B, N, H, D) -> Permute -> (B, H, N, D/1)
+                gate = gate.permute(0, 2, 1, 3)
+                out = out * F.sigmoid(gate)
+
+            out = out.reshape(B, N, C)
+
+        elif self.attn_mode == 'flash_attn' and HAS_FLASH_ATTENTION:
+            if torch.isnan(q).any() or torch.isinf(q).any():
+                print("!!! Q contains NaN/Inf BEFORE FlashAttn")
+
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).contiguous() if cu_seqlens is not None else None
+
+            # Reshape Q, K, V to (Total, Num_Heads, Head_Dim) for flash_attn_varlen_func
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            k = k.reshape(-1, self.num_heads, self.head_dim)
+            v = v.reshape(-1, self.num_heads, self.head_dim)
+
+            if torch.isnan(q).any(): print("!!! Q is NaN BEFORE Norm")
+
+            q, k = self.q_norm(q), self.k_norm(k)
+
+            if torch.isnan(q).any():
+                print(f"!!! Q contains NaN AFTER Norm. Q_Norm Weight: {self.q_norm.weight.mean()}")
+
+            # Cast to bf16/fp16 for flash attention
+            if q.dtype == torch.float32:
+                target_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+                q = q.to(target_dtype)
+                k = k.to(target_dtype)
+                v = v.to(target_dtype)
+                if gate is not None:
+                    gate = gate.to(target_dtype)
+            elif gate is not None and gate.dtype != q.dtype:
+                gate = gate.to(q.dtype)
+
+            if cu_seqlens is not None and max_seqlen is not None:
+                # Variable-length path: cu_seqlens and max_seqlen are pre-computed by the caller.
+                # q/k/v are already packed as (Total, H, D) when input x is packed.
+                out = flash_attn_varlen_func(
+                    q, k, v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=self.proj_drop_rate if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=self.is_causal,
+                )
+                out = out.reshape(B, N, self.num_heads, self.head_dim)  # Reshape back to (B, N, H, D)
+            else:
+                # Fixed-length path: reshape to (B, N, H, D) for flash_attn_func
+                q = q.reshape(B, N, self.num_heads, self.head_dim)
+                k = k.reshape(B, N, self.num_heads, self.head_dim)
+                v = v.reshape(B, N, self.num_heads, self.head_dim)
+                out = flash_attn_func(q, k, v, dropout_p=self.proj_drop_rate if self.training else 0.0, causal=self.is_causal)
             if return_attn:
-                x, attn, _ = flash_attn_qkvpacked_func(qkv, dropout_p=self.proj_drop_rate)
+                out, attn, _ = flash_attn_func(q, k, v, dropout_p=self.proj_drop_rate if self.training else 0.0, causal=self.is_causal, return_attn_probs=True)
+
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
+
+            if gate is not None:
+                out = out * F.sigmoid(gate)
+
+            # Reshape back to input shape
+            if is_packed:
+                out = out.reshape(N, C)
+            else:
+                out = out.reshape(B, N, C)
         else:
             raise Exception('error')
-        x = x.reshape(B, N, C)
-        x = self.proj(x)
+            
+        x = self.proj(out)
         x = self.proj_drop(x)
         if return_attn:
             return x, attn
         return x, None
 
-
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_mode='normal'):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, qk_norm=False,
+                 proj_bias=True, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm, attn_mode='normal', attn_causal=False, gate_attention='none', init_values=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, attn_mode=attn_mode)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, qk_norm=qk_norm,
+            proj_bias=proj_bias, attn_drop=attn_drop, proj_drop=drop, attn_mode=attn_mode,
+            is_causal=attn_causal, gate_attention=gate_attention,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, return_attention=False):
-        y, attn = self.attn(self.norm1(x), return_attention)
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
 
-        x = x + self.drop_path(y)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+    def forward(self, x, return_attention=False, cu_seqlens=None, max_seqlen=None):
+        y, attn = self.attn(self.norm1(x), return_attn=return_attention, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        x = x + self.drop_path1(self.ls1(y))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         if return_attention:
             return x, attn
         return x
-
 
 class VisionTransformer(nn.Module):
     """ Vision Transformer """
@@ -244,6 +329,8 @@ class VisionTransformer(nn.Module):
         mlp_ratio=4.0,
         qkv_bias=True,
         qk_scale=None,
+        qk_norm=False,
+        proj_bias=True,
         drop_rate=0.0,
         attn_drop_rate=0.0,
         drop_path_rate=0.0,
@@ -253,6 +340,8 @@ class VisionTransformer(nn.Module):
         gradient_checkpointing=False,
         encoder_mode=False,
         add_cls_token=False,
+        attn_causal=False,
+        gate_attention='none',
         **kwargs
     ):
         super().__init__()
@@ -274,7 +363,7 @@ class VisionTransformer(nn.Module):
             self.num_patches = img_size[0] * (img_size[1] // patch_size)
             encoder_mode = False
         
-        # -- pos embedding; TODO: try other options
+        # -- pos embedding;
         self.pos_embed = nn.Parameter(torch.randn(1, img_size[0], embed_dim))
         if add_cls_token and not encoder_mode:  # seperate cls pos emb for decoder mode
             self.pos_embed_cls_dec = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -289,7 +378,8 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, attn_mode=attn_mode)
+                qk_norm=qk_norm, proj_bias=proj_bias, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
+                norm_layer=norm_layer, attn_mode=attn_mode, attn_causal=attn_causal, gate_attention=gate_attention)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # ------
@@ -318,7 +408,7 @@ class VisionTransformer(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, masks=None, return_attention=False, **kwargs):
+    def forward(self, x, masks=None, return_attention=False, cu_seqlens=None, max_seqlen=None, **kwargs):
         if masks is not None:
             if not isinstance(masks, list):
                 masks = [masks]
@@ -352,16 +442,18 @@ class VisionTransformer(nn.Module):
         for i, blk in enumerate(self.blocks):
             if self.gradient_checkpointing and self.training:
                 if return_attention:
-                    x, attn = torch.utils.checkpoint.checkpoint(blk, x, return_attention, use_reentrant=False)
+                    x, attn = torch.utils.checkpoint.checkpoint(
+                        blk, x, return_attention, cu_seqlens, max_seqlen, use_reentrant=False)
                     attn_set.append(attn.detach().cpu())
                 else:
-                    x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                    x = torch.utils.checkpoint.checkpoint(
+                        blk, x, False, cu_seqlens, max_seqlen, use_reentrant=False)
             else:
                 if return_attention:
-                    x, attn = blk(x, return_attention)
+                    x, attn = blk(x, return_attention=return_attention, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                     attn_set.append(attn.detach().cpu())
                 else:
-                    x = blk(x)
+                    x = blk(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         if self.norm is not None:
             x = self.norm(x)
@@ -385,141 +477,8 @@ class VisionTransformer(nn.Module):
         )
         pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_emb.unsqueeze(0), pos_embed), dim=1)
-
-
-class VisionTransformerLatentEnc(VisionTransformer):
-    def __init__(self, num_latent_tokens, latent_token_size, add_cls_token=False, **kwargs):
-        super().__init__(**kwargs)
-        
-        assert kwargs['in_chans'] == 1, "Encoder only"
-        self.num_latent_tokens = num_latent_tokens
-        self.latent_token_size = latent_token_size
-        self.add_cls_token = add_cls_token
-
-        embed_dim = kwargs['embed_dim']
-        scale = embed_dim ** -0.5
-        self.latent_token_positional_embedding = nn.Parameter(
-            scale * torch.randn(self.num_latent_tokens, embed_dim))
-
-        if self.add_cls_token:
-            self.num_latent_tokens += 1
-            self.cls_token = nn.Parameter(scale * torch.randn(1, embed_dim))
-
-        # TODO remove this?
-        self.conv_out = nn.Conv1d(embed_dim, self.latent_token_size, kernel_size=1, bias=True)
-
-    def forward(self, x, latent_tokens, masks=None, return_attention=False, **kwargs):
-        if masks is not None:
-            if not isinstance(masks, list):
-                masks = [masks]
-
-        # -- patchify x
-        x = self.patch_embed(x)
-        B, N, D = x.shape
-        
-        # concat cls token, follow TiTok
-        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1) if self.add_cls_token else x
-
-        # -- add positional embedding to x
-        # pos_embed = self.interpolate_pos_encoding(x, pos_embed)
-        num_time_patches = N // self.pos_embed.shape[1]
-        pos_embed = self.pos_embed.unsqueeze(2).repeat(1, 1, num_time_patches, 1)  # [1, N, T, D]
-        pos_embed = pos_embed.reshape(1, -1, D)
-        x = x + pos_embed
-
-        # -- mask x
-        if masks is not None:
-            x = apply_masks(x, masks)
-
-        # prepare latent
-        latent_tokens = latent_tokens.unsqueeze(0).expand(B, -1, -1).to(x.dtype)
-        latent_tokens = latent_tokens + self.latent_token_positional_embedding.to(x.dtype)
-        x = torch.cat([x, latent_tokens], dim=1)
-
-        # -- fwd prop
-        attn_set = []
-        for i, blk in enumerate(self.blocks):
-            if self.gradient_checkpointing and self.training:
-                if return_attention:
-                    x, attn = torch.utils.checkpoint.checkpoint(blk, x, return_attention, use_reentrant=False)
-                    attn_set.append(attn.detach().cpu())
-                else:
-                    x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
-            else:
-                if return_attention:
-                    x, attn = blk(x, return_attention)
-                    attn_set.append(attn.detach().cpu())
-                else:
-                    x = blk(x)
-
-        if self.norm is not None:
-            x = self.norm(x)
-
-        latent_tokens = x[:, self.num_latent_tokens:]
-        latent_tokens = latent_tokens.transpose(-1, -2)
-        latent_tokens = self.conv_out(latent_tokens).transpose(-1, -2)  # B N_latent C'
-        
-        if return_attention:
-            return latent_tokens, attn_set
-        return latent_tokens
-
-
-class VisionTransformerLatentDec(VisionTransformer):
-    def __init__(self, num_latent_tokens, latent_token_size, add_cls_token=False, **kwargs):
-        super().__init__(**kwargs)
-
-        self.num_latent_tokens = num_latent_tokens
-        self.latent_token_size = latent_token_size
-        self.add_cls_token = add_cls_token       
-
-        embed_dim = kwargs['embed_dim']
-        scale = embed_dim ** -0.5
-        self.decoder_embed = nn.Linear(self.num_latent_tokens, embed_dim, bias=True)
-
-        if self.add_cls_token:
-            self.cls_token = nn.Parameter(scale * torch.randn(1, embed_dim))
-            self.num_latent_tokens += 1
-        self.positional_embedding = nn.Parameter(
-                scale * torch.randn(self.num_latent_tokens + 1, embed_dim))
-        
-        self.mask_token = nn.Parameter(scale * torch.randn(1, 1, embed_dim))
-        self.latent_token_positional_embedding = nn.Parameter(
-            scale * torch.randn(self.num_latent_tokens, embed_dim))
-
-    def forward(self, z_quantized):
-        B, N, C = z_quantized.shape
-        x = self.decoder_embed(z_quantized)
-        
-        mask_tokens = self.mask_token.repeat(B, self.num_latent_tokens, 1).to(x.dtype)
-        if self.add_cls_token:
-            mask_tokens = torch.cat([self.cls_token.unsqueeze(0).expand(B, -1, -1).to(mask_tokens.dtype),
-                                    mask_tokens], dim=1)
-        mask_tokens = mask_tokens + self.positional_embedding.to(mask_tokens.dtype)
-        x = x + self.latent_token_positional_embedding[:N]
-        x = torch.cat([mask_tokens, x], dim=1)
-
-        # -- fwd prop
-        attn_set = []
-        for i, blk in enumerate(self.blocks):
-            if self.gradient_checkpointing and self.training:
-                if return_attention:
-                    x, attn = torch.utils.checkpoint.checkpoint(blk, x, return_attention, use_reentrant=False)
-                    attn_set.append(attn.detach().cpu())
-                else:
-                    x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
-            else:
-                if return_attention:
-                    x, attn = blk(x, return_attention)
-                    attn_set.append(attn.detach().cpu())
-                else:
-                    x = blk(x)
-
-        if self.norm is not None:
-            x = self.norm(x)
-
-        return x
     
-
+    
 def vit_small(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,

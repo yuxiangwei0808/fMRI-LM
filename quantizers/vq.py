@@ -54,6 +54,7 @@ class VQ(nn.Module):
             config.in_chans = embed_dim
         print('Final decoder config', config)
         self.decoder_raw = enc_cls(**dict(config))
+        # self.decoder_raw = vit_base(**dict(config))
 
         self.quantize = NormEMAVectorQuantizer(
             n_embed=codebook_size, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
@@ -191,9 +192,9 @@ class VQ(nn.Module):
 class VQ_Align(nn.Module):
     def __init__(self, config, lm_name='gpt2', **kwargs):
         super(VQ_Align, self).__init__()
-        self.VQ = VQ(config, decoder_out_dim=config.img_size[1])
-        self.num_tokens = self.VQ.encoder.num_patches
-        self.enc_embed_dim = self.VQ.enc_embed_dim
+        self.quantizer = VQ(config, decoder_out_dim=config.img_size[1])
+        self.num_tokens = self.quantizer.encoder.num_patches
+        self.enc_embed_dim = self.quantizer.enc_embed_dim
 
         self.lm_name = lm_name
         model_hf = AutoModelForCausalLM.from_pretrained(lm_name)
@@ -223,7 +224,7 @@ class VQ_Align(nn.Module):
     
     def forward(self, x, y_raw=None, alpha=0):
         if y_raw is not None:
-            loss, encoder_features, log = self.VQ(x, y_raw, alpha=alpha)
+            loss, encoder_features, log = self.quantizer(x, y_raw)
             encoder_features = self.x_proj(encoder_features)
             reverse_x = ReverseLayerF.apply(encoder_features, alpha)
             domain_out = self.domain_classifier(reverse_x)

@@ -4,7 +4,7 @@ if [ -f ~/.bashrc ]; then
     source ~/.bashrc
 fi
 export PATH="/sysapps/ubuntu-applications/miniconda/4.12.0/miniconda3/bin:$PATH"
-cd ~/playground/BrainFM
+cd ~/playground/BrainFM/public_repos/fMRI-LM
 
 source activate 
 conda activate playground
@@ -31,22 +31,20 @@ export TOKENIZERS_PARALLELISM=false
 # accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=fp16 train_instruction_open_ended.py \
 # accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=fp16 train_instruction_mq.py \
 accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=bf16 train_instruction.py \
- --ckpt_dir=checkpoints/instruction/UKB_ABCD_HCP_robust/VQ-ViT_base_p160_qwen0.6B-allClsTasks-add_src_desc-delimiter-PEFT2_all_8_16_.1-textW.1 \
- --wandb_runname=UKB_ABCD_HCP_robust-VQ-ViT_base_p160_qwen0.6B-allClsTasks-add_src_desc \
+ --ckpt_dir=checkpoints/instruction/UKB_robust/VQ-ViT_base_p160_gpt2 \
  --lm_name=Qwen/Qwen3-0.6B \
  --wandb_group=pretrained \
- --cfg_path=configs/vit_base_qwen_p32.yaml \
- --global_fmri_batch_size=64 \
+ --cfg_path=configs/vit_base_p160.yaml \
  --gradient_accumulation_steps=8 \
- --epochs=20 \
+ --epochs=30 \
  --quantizer=vq \
- --wandb_project=BrainFM_instruction_all \
  --add_src_info \
  --save_ckpt \
  --use_random_prompt \
  --use_allowed_tokens \
  --add_desc \
- --pretrained_ckpt=checkpoints/pretrain/UKB_ABCD_HCP_robust/VQ_Align-ViT_base-p32-Qwen3-0.6B-Contr_F2T-DeepSpeed-delimiter-PEFT_all_8_16_.1-textW.1/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt \
+ --lm_name=Qwen/Qwen3-0.6B \
+ --pretrained_ckpt=checkpoints/pretrain/UKB-robust/fc_ica_text0.1_f2t1_Qwen3-0.6B_lora_r1_a2_drop.1_qk_0415_143500/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt \
 #  --tokenizer_ckpt=checkpoints/tokenizer/UKB_ABCD_HCP_robust/VQ_Align-ViT_base-p160-Qwen3-0.6B/ckpt-best.pt \
 #  --fewshot_samples=10 \
 #  --wandb_log \

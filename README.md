@@ -18,7 +18,7 @@ The framework supports multiple large language models (GPT-2, Qwen) and can hand
 ## Key Features
 
 - ✅ **Multi-stage training pipeline**: Tokenizer pre-training → Paired alignment → Instruction tuning
-- ✅ **Flexible quantization schemes**: Vector Quantization (VQ), Finite Scalar Quantization (FSQ), TiTok
+- ✅ **Flexible quantization schemes**: Vector Quantization (VQ), Finite Scalar Quantization (FSQ)
 - ✅ **LoRA-based parameter-efficient fine-tuning** for instruction following
 - ✅ **Zero-shot evaluation** on clinical prediction tasks
 - ✅ **Multi-dataset support** with dataset-specific preprocessing
@@ -31,13 +31,13 @@ fMRI Signal (N_rois × N_timepoints)
     ↓
 Vision Transformer Encoder
     ↓
-Vector Quantizer (VQ/FSQ/TiTok)
+Vector Quantizer (VQ/FSQ)
     ↓
 Projection Layer
     ↓
 Large Language Model (GPT-2/Qwen)
     ↓
-Text Generation / Classification
+Text Generation
 ```
 
 ## Installation
@@ -70,29 +70,29 @@ pip install deepspeed
 ├── brain_encoder/           # Vision Transformer encoder for fMRI
 │   ├── vision_transformer.py
 │   ├── patch_embed.py
-│   └── titok_models_vanilla.py
 ├── language_models/         # LLM implementations (Adapt from huggingface's implementations with key modifications to the attention mask)
 │   ├── gpt2.py
 │   └── qwen3.py
 ├── quantizers/              # Quantization modules
 │   ├── vq.py               # Vector Quantization
 │   ├── fsq.py              # Finite Scalar Quantization
-│   └── titok/              # TiTok tokenizer
 ├── metrics/                 # Evaluation metrics
 ├── configs/                 # Model and dataset configurations
-│   ├── vit_base_qwen_p160.yaml
+│   ├── vit_base_p160.yaml
 │   ├── dataset_config.yaml
 │   └── ...
 ├── scripts/                 # Training and evaluation scripts
-│   ├── launch_train_quantizer_contr.sh
-│   ├── launch_train_pretrain_paired.sh
-│   ├── launch_train_instruction.sh
+|   ├── launch_train_quantizer.sh        # Stage 1: Toenizer training (without contrastive learning)
+│   ├── launch_train_quantizer_contr.sh  # Stage 1: Tokenizer training
+│   ├── launch_train_pretrain_paired_deepspeed.sh  # Stage 2: LLM tuning
+│   ├── launch_train_instruction.sh      # Stage 3: Instruction tuning
 │   └── eval_zeroshot.sh
+├── train_quantizer.py          # Stage 1: Tokenizer training (without contrastive learning)
 ├── train_quantizer_contr.py    # Stage 1: Tokenizer training
-├── train_pretrain_paired.py    # Stage 2: Paired alignment
+├── train_pretrain_paired.py    # Stage 2: LLM tuning
 ├── train_instruction.py         # Stage 3: Instruction tuning
 ├── eval_zeroshot.py            # Zero-shot evaluation
-├── model_mindlm.py             # Main model architecture
+├── model_fmrilm.py             # Main model architecture
 ├── model_gpt.py                # Multimodal LLM wrapper
 ├── dataset.py                  # Data loading utilities
 └── utils.py                    # Helper functions
@@ -163,51 +163,19 @@ datasets:
 Train the fMRI tokenizer to align brain signals with text embeddings:
 
 ```bash
-bash scripts/launch_train_quantizer_contr.sh
-```
-
-Or run directly:
-
-```bash
-accelerate launch train_quantizer_contr.py \
-  --dataset_dir data/UKB/fmri/TianS3/,data/ABCD/fmri/TianS3/ \
-  --ckpt_dir checkpoints/tokenizer/VQ_Align-ViT_base-p160 \
-  --cfg_path configs/vit_base_qwen_p160.yaml \
-  --quantizer vq \
-  --desc_type fc,ica \
-  --epochs 50 \
-  --batch_size 16 \
-  --save_ckpt
+bash scripts/launch_train_quantizer.sh
 ```
 
 **Key arguments:**
-- `--quantizer`: Quantization type (`vq`, `fsq`, `titok`)
+- `--quantizer`: Quantization type (`vq`, `fsq`)
 - `--desc_type`: Text descriptor types for alignment (`fc`, `ica`, `gradient`, `graph`)
-- `--clip_loss_type`: Contrastive loss (`clip`, `soft_clip`, `siglip`)
 
 ### Stage 2: Paired Pre-training
 
 Align fMRI tokens with language model using paired fMRI-text data:
 
 ```bash
-bash scripts/launch_train_pretrain_paired.sh
-```
-
-Or run directly:
-
-```bash
-accelerate launch --mixed_precision=bf16 train_pretrain_paired.py \
-  --tokenizer_path checkpoints/tokenizer/VQ_Align-ViT_base-p160/ckpt.pt \
-  --ckpt_dir checkpoints/pretrain/VQ-ViT_base-p160-qwen0.6B \
-  --cfg_path configs/vit_base_qwen_p160.yaml \
-  --lm_name Qwen/Qwen3-0.6B \
-  --dataset_dir data/UKB/fmri/TianS3/,data/ABCD/fmri/TianS3/ \
-  --quantizer vq \
-  --epochs 50 \
-  --fmri_batch_size 16 \
-  --text_only_weight 1.0 \
-  --fmri_only_weight 0.5 \
-  --save_ckpt
+bash scripts/launch_train_pretrain_paired_deepspeed.sh
 ```
 
 **Key arguments:**
@@ -216,30 +184,25 @@ accelerate launch --mixed_precision=bf16 train_pretrain_paired.py \
 - `--fmri_only_weight`: Weight for fMRI-only language modeling loss
 - `--fmri2text_weight`: Weight for fMRI-to-text generation loss
 
+**Note**
+Training with deepspeed requires additional postprocessing of the checkpoint.
+If using DeepSpeed, merge sharded checkpoints:
+
+```bash
+cd checkpoints/pretrain/model_name/deepspeed_checkpoint
+python zero_to_fp32.py . .
+cd -
+python merge_deepspeed_checkpoint.py \
+  --deepspeed_dir checkpoints/pretrain/model_name/deepspeed_checkpoint/
+```
+
+
 ### Stage 3: Instruction Tuning
 
 Fine-tune the model for specific downstream tasks:
 
 ```bash
 bash scripts/launch_train_instruction.sh
-```
-
-Or run directly:
-
-```bash
-accelerate launch --mixed_precision=bf16 train_instruction.py \
-  --pretrained_ckpt checkpoints/pretrain/VQ-ViT_base-p160-qwen0.6B/ckpt.pt \
-  --ckpt_dir checkpoints/instruction/VQ-ViT_base-qwen0.6B-classification \
-  --cfg_path configs/vit_base_qwen_p160.yaml \
-  --lm_name Qwen/Qwen3-0.6B \
-  --quantizer vq \
-  --global_fmri_batch_size 64 \
-  --gradient_accumulation_steps 8 \
-  --epochs 20 \
-  --add_src_info \
-  --add_desc \
-  --use_allowed_tokens \
-  --save_ckpt
 ```
 
 **Key arguments:**
@@ -259,19 +222,6 @@ Evaluate pre-trained models on classification tasks without fine-tuning:
 bash scripts/eval_zeroshot.sh
 ```
 
-Or run directly:
-
-```bash
-python eval_zeroshot.py \
-  --checkpoint checkpoints/pretrain/VQ-ViT_base-p160-qwen0.6B/ckpt.pt \
-  --output_dir results/zeroshot/ \
-  --cfg_path configs/vit_base_qwen_p160.yaml \
-  --lm_name Qwen/Qwen3-0.6B \
-  --datasets UKB,ABCD,HCP \
-  --batch_size 32 \
-  --use_allowed_tokens
-```
-
 **Key arguments:**
 - `--checkpoint`: Path to model checkpoint
 - `--datasets`: Comma-separated list of datasets to evaluate
@@ -279,78 +229,7 @@ python eval_zeroshot.py \
 
 ## Model Checkpoints
 
-Pretrained models will be available at [link to be added].
-
-**Available Models:**
-- `VQ-ViT_base-p160-GPT2`: ViT-Base encoder + GPT-2 decoder
-- `VQ-ViT_base-p160-Qwen0.6B`: ViT-Base encoder + Qwen3-0.6B decoder
-- `VQ-ViT_large-p160-Qwen0.6B`: ViT-Large encoder + Qwen3-0.6B decoder
-
-## Configuration Files
-
-### Model Configuration (`configs/vit_base_qwen_p160.yaml`)
-
-```yaml
-model:
-  vq_model:
-    patch_size: 160           # Temporal patch size
-    n_embd: 768              # Embedding dimension
-    num_rois: 450            # Number of brain regions
-    num_timestamp: 160       # Time points per ROI
-    enc_cls: vit_base        # Encoder architecture
-    
-  lm:
-    base_model: Qwen/Qwen3-0.6B
-    num_fmri_tokens: 450
-    fmri_vocab_size: 8192
-    use_fmri_lm_head: true
-    add_fmri_delimiter: true
-    peft_tune: true          # Enable LoRA
-    temperature: 0.7
-    top_p: 0.8
-```
-
-## Advanced Usage
-
-### Using DeepSpeed
-
-For large-scale distributed training:
-
-```bash
-bash scripts/launch_train_pretrain_paired_deepspeed.sh
-```
-
-Configure DeepSpeed settings in `configs/deepspeed_zero2.json` or `configs/deepspeed_zero3.json`.
-
-### Custom Datasets
-
-To add a new dataset:
-
-1. Prepare data in HDF5 format following the structure above
-2. Add dataset info to `dataset.py`:
-   ```python
-   DATASET_INFO = {
-       'MyDataset': 'Description of the cohort...',
-   }
-   ```
-3. Update `configs/dataset_config.yaml`:
-   ```yaml
-   datasets:
-     MyDataset:
-       targets:
-         - target1
-         - target2
-   ```
-
-### Merge DeepSpeed Checkpoints
-
-If using DeepSpeed, merge sharded checkpoints:
-
-```bash
-python merge_deepspeed_checkpoint.py \
-  --checkpoint_dir checkpoints/pretrain/model_name/deepspeed_checkpoint/ \
-  --output_file checkpoints/pretrain/model_name/merged_checkpoint.pt
-```
+Pretrained tokenizer (stage 1) and LLM (stage 2) checkpoints are available at `https://drive.google.com/drive/folders/1vGN12_bCg4CY2d7AodLw163TuP1QKlkG?usp=drive_link`
 
 ## Supported Datasets
 

@@ -16,7 +16,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from transformers import AutoModel
 import math
 
-from quantizers import VQ, FSQ_Model, TiTok, VQ_Align
+from quantizers import VQ, FSQ_Model, VQ_Align
 from dataset import fMRITextDataset
 from brain_encoder import vit_small, vit_base, vit_large
 from utils_loss import clip_loss, soft_clip_loss, siglip_loss, soft_siglip_loss

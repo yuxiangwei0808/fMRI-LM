@@ -16,12 +16,12 @@ import shutil
 
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from model_mindlm import MindLM
+from model_fmrilm import fMRILM
 from quantizers import *
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data_inst
@@ -167,15 +167,15 @@ def save_configurations(ckpt_dir, args, cfg_path, logger):
         f.write(f"  Use Random Prompt: {args.use_random_prompt}\n")
         f.write(f"  Add Source Info: {args.add_src_info}\n")
         f.write(f"  Add Description: {args.add_desc}\n")
+        f.write(f"  Add fMRI Description: {args.add_fmri_desc}\n")
     logger.info(f"Experiment summary saved to: {summary_file}")
     
     return config_dir
 
 
 def main(args):
-    # Create timestamped checkpoint directory (unless resuming)
-    if not args.resume:
-        args.ckpt_dir = create_timestamped_dir(args.ckpt_dir, add_timestamp=not args.no_timestamp)
+    # Create timestamped checkpoint directory
+    args.ckpt_dir = create_timestamped_dir(args.ckpt_dir, add_timestamp=not args.no_timestamp)
     
     # Setup logging
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -183,8 +183,7 @@ def main(args):
     logger = setup_logging(log_file=log_file)
     
     # Save all configurations
-    if not args.resume:
-        save_configurations(args.ckpt_dir, args, args.cfg_path, logger)
+    save_configurations(args.ckpt_dir, args, args.cfg_path, logger)
     
     # Initialize Accelerator
     try:
@@ -306,12 +305,13 @@ def main(args):
         int(1.5 * args.fmri_batch_size),
         args.datasets,
         lm_name=args.lm_name,
-        norm='robust',
+        norm=args.norm,
         patch_size=quantizer_cfg.patch_size,
         next_time_mask=(args.quantizer != 'titok'),
         use_random_prompt=args.use_random_prompt,
         add_source_info=args.add_src_info,
         add_desc=args.add_desc,
+        add_fmri_desc=args.add_fmri_desc,
         dataset_target_mapping=dataset_target_mapping,
         dataset_config_dict=dataset_config_dict,
         fewshot_samples=args.fewshot_samples,
@@ -322,24 +322,10 @@ def main(args):
         quantizer_cls = VQ
     elif args.quantizer == 'fsq':
         quantizer_cls = FSQ_Model
-    elif args.quantizer == 'titok':
-        quantizer_cls = TiTok
 
     # Create tokenizer
     try:
-        if args.quantizer == 'titok':
-            tokenizer = quantizer_cls(quantizer=quantizer_cfg.quantizer,
-                num_latent_tokens=quantizer_cfg.num_latent_tokens,
-                latent_token_size=quantizer_cfg.latent_token_size,
-                model_size=quantizer_cfg.model_size,
-                image_size=quantizer_cfg.img_size,
-                patch_size=quantizer_cfg.patch_size,
-                codebook_size=quantizer_cfg.codebook_size,
-                commitment_cost=quantizer_cfg.commitment_cost,
-                use_l2_norm=quantizer_cfg.use_l2_norm,
-            )
-        else:
-            tokenizer = quantizer_cls(quantizer_cfg, decoder_out_dim=quantizer_cfg.num_timestamp)
+        tokenizer = quantizer_cls(quantizer_cfg, decoder_out_dim=quantizer_cfg.num_timestamp)
 
         latent_tokens = None
         if args.quantizer == 'titok':
@@ -353,11 +339,7 @@ def main(args):
         raise
 
     # Model initialization
-    ckpt_path = os.path.join(args.ckpt_dir, 'ckpt.pt')
-    if os.path.exists(ckpt_path) and args.resume:
-        init_from = 'resume'
-        logger.info(f"Resuming training from checkpoint: {ckpt_path}")
-    elif (args.pretrained_ckpt and os.path.exists(args.pretrained_ckpt)):
+    if (args.pretrained_ckpt and os.path.exists(args.pretrained_ckpt)):
         # Check if it's a DeepSpeed checkpoint directory
         if os.path.isdir(args.pretrained_ckpt):
             logger.error(f"ERROR: DeepSpeed checkpoint directory detected: {args.pretrained_ckpt}")
@@ -382,7 +364,9 @@ def main(args):
     iter_num = 0
     n_embd = quantizer_cfg.n_embd
     dropout = 0.0
-    model_args = copy.deepcopy(lm_cfg)
+    # Convert to a plain dict so that checkpoint model_args (which may have extra keys
+    # like LoRA hyperparameters) can be merged without OmegaConf struct-mode errors.
+    model_args = OmegaConf.to_container(lm_cfg, resolve=True)
     
     # Initialize best metrics tracking (separate for regression and classification)
     best_avg_metric_regression = -float('inf')
@@ -391,74 +375,22 @@ def main(args):
     all_results = {'validation': {}, 'test': {}}
 
     try:
-        if init_from == 'resume':
-            logger.info(f"Resuming training from {args.ckpt_dir}")
-            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            model_args = checkpoint['model_args']
-            
-            # Load best metrics if available (backward compatible with old checkpoints)
-            if 'best_avg_metric_regression' in checkpoint:
-                best_avg_metric_regression = checkpoint['best_avg_metric_regression']
-                logger.info(f"Loaded best average regression metric: {best_avg_metric_regression}")
-            elif 'best_avg_metric' in checkpoint:
-                # Backward compatibility
-                best_avg_metric_regression = checkpoint['best_avg_metric']
-                logger.info(f"Loaded best average metric (legacy): {best_avg_metric_regression}")
-            
-            if 'best_avg_metric_classification' in checkpoint:
-                best_avg_metric_classification = checkpoint['best_avg_metric_classification']
-                logger.info(f"Loaded best average classification metric: {best_avg_metric_classification}")
-            elif 'best_avg_metric' in checkpoint:
-                # Backward compatibility
-                best_avg_metric_classification = checkpoint['best_avg_metric']
-                logger.info(f"Loaded best average metric (legacy): {best_avg_metric_classification}")
-            
-            # Try to load previous results
-            results_dir = os.path.join(args.ckpt_dir, 'results')
-            if os.path.exists(results_dir):
-                all_results_file = os.path.join(results_dir, 'all_results.json')
-                best_metrics_file = os.path.join(results_dir, 'best_metrics.json')
-                
-                if os.path.exists(all_results_file):
-                    try:
-                        with open(all_results_file, 'r') as f:
-                            all_results = json.load(f)
-                        logger.info("Loaded previous validation/test results")
-                    except Exception as e:
-                        logger.warning(f"Could not load previous results: {e}")
-                
-                if os.path.exists(best_metrics_file):
-                    try:
-                        with open(best_metrics_file, 'r') as f:
-                            best_summary = json.load(f)
-                            best_metrics_per_dataset = best_summary.get('best_metrics_per_dataset', {})
-                            main._best_epoch_regression = best_summary.get('best_epoch_regression', 0)
-                            main._best_epoch_classification = best_summary.get('best_epoch_classification', 0)
-                            # Backward compatibility
-                            if 'best_epoch' in best_summary and not main._best_epoch_regression:
-                                main._best_epoch_regression = best_summary['best_epoch']
-                                main._best_epoch_classification = best_summary['best_epoch']
-                        logger.info("Loaded best metrics tracking")
-                    except Exception as e:
-                        logger.warning(f"Could not load best metrics: {e}")
-            
-            gptconf = MultimodalConfig(**model_args)
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
-
-            state_dict = checkpoint['model']
-            unwanted_prefix = '_orig_mod.'
-            for k,v in list(state_dict.items()):
-                if k.startswith(unwanted_prefix):
-                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-            model.load_state_dict(state_dict)
-            iter_num = checkpoint['iter_num']
-            start_epoch = checkpoint['epoch'] + 1
-            logger.info(f"Resumed from epoch {start_epoch}, iteration {iter_num}")
-        elif init_from == 'pretrained':
+        if init_from == 'pretrained':
             logger.info(f"Initializing from pretrained weights")
             checkpoint = torch.load(args.pretrained_ckpt, map_location='cpu', weights_only=False)
-            model_args.update(checkpoint['model_args'])
-            # gptconf = GPTConfig(**model_args)
+            # Merge checkpoint model_args into current model_args (plain dicts, no OmegaConf issues)
+            ckpt_model_args = checkpoint['model_args']
+            if hasattr(ckpt_model_args, '_metadata') or hasattr(ckpt_model_args, '_iter_ex'):
+                ckpt_model_args = OmegaConf.to_container(ckpt_model_args, resolve=True)
+            model_args.update(ckpt_model_args)
+            # CLI --freeze_pretrained_lora overrides checkpoint config
+            if args.freeze_pretrained_lora:
+                model_args['freeze_pretrained_lora'] = True
+            logger.info(f"Merged pretrained model_args (includes LoRA config): "
+                        f"peft_tune={model_args.get('peft_tune')}, "
+                        f"lora_r={model_args.get('lora_r')}, "
+                        f"lora_alpha={model_args.get('lora_alpha')}, "
+                        f"lora_target_modules={model_args.get('lora_target_modules')}")
             gptconf = MultimodalConfig(**model_args)
             
             # Check if pretrained model was trained with PEFT/LoRA
@@ -467,17 +399,20 @@ def main(args):
             # IMPORTANT: Always create model with peft_tune=False first to avoid double-application
             # We'll manually apply LoRA after if needed
             temp_peft_flag = gptconf.peft_tune
+            temp_freeze_flag = gptconf.freeze_pretrained_lora if hasattr(gptconf, 'freeze_pretrained_lora') else False
             gptconf.peft_tune = False
+            gptconf.freeze_pretrained_lora = False
             
-            model = MindLM(gptconf, tokenizer_encoder, False, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, False, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, latent_tokens=latent_tokens)
             
             if pretrained_use_peft:
                 # Pretrained model has LoRA - apply LoRA to match checkpoint structure before loading
                 logger.info("Pretrained checkpoint contains LoRA weights - applying LoRA to match structure")
                 model.llm.apply_lora()
             
-            # Restore flag for later use (after loading checkpoint)
+            # Restore flags for later use (after loading checkpoint)
             gptconf.peft_tune = temp_peft_flag
+            gptconf.freeze_pretrained_lora = temp_freeze_flag
 
             state_dict = checkpoint['model']
             unwanted_prefix = '_orig_mod.'
@@ -527,7 +462,7 @@ def main(args):
                 assert msg.missing_keys == []
             
             tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, latent_tokens=latent_tokens)
 
             start_epoch = 0
             logger.info("Model tokenizer initialized from checkpoint")
@@ -544,7 +479,7 @@ def main(args):
     if lm_cfg.get('peft_tune', False):
         # Check if model already has LoRA (from pretrained checkpoint)
         already_has_lora = hasattr(model.llm.base_model, 'peft_config')
-        freeze_pretrained = lm_cfg.get('freeze_pretrained_lora', False)
+        freeze_pretrained = args.freeze_pretrained_lora or lm_cfg.get('freeze_pretrained_lora', False)
         
         if already_has_lora and freeze_pretrained:
             # Scenario: Pretrained has LoRA-A, freeze it and add new LoRA-B
@@ -577,9 +512,6 @@ def main(args):
     # Optimizer
     try:
         optimizer = model.configure_optimizers(args.weight_decay, args.learning_rate, (args.beta1, args.beta2), accelerator.device.type)
-        if init_from == 'resume':
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            logger.info("Optimizer state loaded from checkpoint")
         checkpoint = None  # free up memory
         logger.info("Optimizer configured successfully")
     except Exception as e:
@@ -589,9 +521,8 @@ def main(args):
     # Learning rate scheduler
     if not args.fewshot_samples:
         num_training_steps_per_epoch = len(data_loader_train)
-        lr_scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=num_training_steps_per_epoch, T_mult=1, eta_min=args.min_lr
-        )
+        # lr_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=num_training_steps_per_epoch, T_mult=1, eta_min=args.min_lr)
+        lr_scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps_per_epoch * args.epochs, eta_min=args.min_lr)
         logger.info(f"Learning rate scheduler configured - steps per epoch: {num_training_steps_per_epoch}")
     
     # Prepare everything with accelerator
@@ -994,21 +925,20 @@ def main(args):
     accelerator.end_training()
 
 
-default_preds = {'sex': ' Male', 'ADHD': ' Control', 'ASD': ' Control', 'age': ' 30'}
-
 def get_pred(pred_string, dataset_info):
     # get the next word after `Answer: `
     pred_words = pred_string.split(' ')
     pred_words = [w.strip() for w in pred_words if w.strip() != '']
-    ans_idx = [i for i, w in enumerate(pred_words) if w.lower().startswith('answer:')][0]
+    ans_idx = [i for i, w in enumerate(pred_words) if w.lower().startswith('answer:')]
     
     default_pred = default_preds.get(dataset_info['target_name'], ' CN')
     
     try:
+        ans_idx = ans_idx[0]
         pred = pred_words[min(ans_idx + 1, len(pred_words) - 1)]
     except IndexError:
         print('Index out of range!', pred_words)
-        pred = default_pred
+        raise Exception("Failed to extract prediction from model output")
     if not dataset_info['is_regression']:
         pred = dataset_info['label_dic'].get(pred, 0.)
     else:
@@ -1086,15 +1016,16 @@ def get_args():
 
     parser.add_argument('--datasets', type=list_of_strs, default=['UKB'],  help='list of dataset names to use for training')
     parser.add_argument('--dataset_config', type=str, default='configs/dataset_config.yaml', help='path to dataset configuration YAML file that defines datasets and their targets')
+    parser.add_argument('--norm', type=str, default='robust', help='normalization method to use')
     parser.add_argument('--add_src_info', default=False, action='store_true', help='whether to add source dataset info to the prompt')
     parser.add_argument('--add_desc', default=False, action='store_true', help='whether to add subject medical descriptions to the prompt')
+    parser.add_argument('--add_fmri_desc', type=list_of_strs, default=[], help='which fMRI feature descriptions to add to the prompt, e.g. --add_fmri_desc=fc,ica')
     parser.add_argument('--fewshot_samples', default=0, type=int, help='number of few-shot samples to include in the prompt')
 
-    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB_ABCD_HCP_robust/VQ_Align-ViT_base-p32-Qwen3-0.6B-Contr_F2T-DeepSpeed-delimiter-PEFT_all_8_16_.1-textW.1/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
+    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB/fc_ica_text0.1_f2t1_Qwen3-0.6B_0119_141603/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
     parser.add_argument('--tokenizer_ckpt', default='')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
     parser.add_argument('--no_timestamp', default=False, action='store_true', help='disable automatic timestamp suffix for checkpoint directory')
-    parser.add_argument('--resume', default=False, action='store_true', help='resume from the latest checkpoint')
     parser.add_argument('--log_interval', default=10, type=int)
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='BrainFM_instruction', type=str)
@@ -1107,7 +1038,6 @@ def get_args():
     parser.add_argument('--global_fmri_batch_size', default=None, type=int, help='global batch size for fMRI across all GPUs')
     parser.add_argument('--text_batch_size', default=1, type=int)
     parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--warmup_epochs', default=5, type=int)
     parser.add_argument('--save_ckpt', default=False, action=argparse.BooleanOptionalAction, help='whether to save checkpoints')
     parser.add_argument('--save_ckpt_freq', default=10, type=int)
     parser.add_argument('--tune_tokenizer', action='store_true', help='whether to finetune the tokenizer during training', default=False)
@@ -1115,16 +1045,18 @@ def get_args():
 
     parser.add_argument('--use_allowed_tokens', action='store_true', help='whether to restrict the generation to allowed tokens', default=False)
 
+    parser.add_argument('--freeze_pretrained_lora', action='store_true', help='whether to freeze the pretrained LoRA adapter and add a new LoRA adapter for instruction tuning', default=False)
+
     parser.add_argument('--quantizer', type=str, default='vq')
     parser.add_argument('--lm_name', type=str, default='Qwen/Qwen3-0.6B', help='name of the language model to use')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_qwen_p32.yaml', help='path to the model config file',)
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_qwen_p160.yaml', help='path to the model config file',)
     parser.add_argument('--lm_use_cls_head', type=bool, default=False, help='direct do prediction from hidden states of LM, update by the model cfg')
 
-    parser.add_argument('--learning_rate', type=float, default=6e-4, metavar='LR',
-                        help='learning rate (default: 6e-4)')
-    parser.add_argument('--min_lr', type=float, default=6e-5)
-    parser.add_argument('--weight_decay', type=float, default=1e-1,
-                        help='weight decay (default: 1e-1)')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',
+                        help='learning rate (default: 1e-3)')
+    parser.add_argument('--min_lr', type=float, default=1e-5)
+    parser.add_argument('--weight_decay', type=float, default=0,
+                        help='weight decay (default: 0)')
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.95)
     parser.add_argument('--grad_clip', type=float, default=1.0,

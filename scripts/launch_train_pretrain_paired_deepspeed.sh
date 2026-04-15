@@ -4,7 +4,7 @@ if [ -f ~/.bashrc ]; then
 fi
 
 export PATH="/sysapps/ubuntu-applications/miniconda/4.12.0/miniconda3/bin:$PATH"
-cd ~/playground/BrainFM
+cd ~/playground/BrainFM/public_repos/fMRI-LM
 
 source activate 
 conda activate playground
@@ -26,26 +26,28 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HOME=/data/users1/ywei/data/cache/
 export DS_SKIP_CUDA_CHECK=1
 
-# DeepSpeed with ZeRO-2: Offload optimizer states to CPU
-# This should allow batch_size=4-8 with Qwen3-4B
+
 accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=bf16 train_pretrain_paired.py \
- --tokenizer_path=checkpoints/tokenizer/UKB_ABCD_HCP_robust/VQ_Align-ViT_base-p32-Qwen3-0.6B/ckpt.pt \
- --ckpt_dir=checkpoints/pretrain/UKB_ABCD_HCP_robust/VQ_Align-ViT_base-p32-Qwen3-0.6B-Contr_F2T-DeepSpeed-delimiter-PEFT_all_8_16_.1-textW.1 \
- --wandb_runname=UKB_ABCD_HCP_robust-vq-ViT_base-p32-Qwen3-0.6B-Contr_F2T-DeepSpeed-delimiter-PEFT_all_8_16_.1-textW.1 \
- --fmri_batch_size=3 \
+ --tokenizer_path=checkpoints/tokenizer/UKB_robust/VQ_Align-ViT_base-p160/ckpt-best.pt \
+ --fmri_batch_size=4 \
  --gradient_accumulation_steps=8 \
- --epochs=20 \
- --quantizer=vq \
+ --epochs=30 \
  --desc_type=fc,ica \
- --save_ckpt \
  --dataset_dir=data/UKB/fmri/TianS3/ \
- --cfg_path=configs/vit_base_qwen_p32.yaml \
+ --cfg_path=configs/vit_base_p160.yaml \
  --lm_name=Qwen/Qwen3-0.6B \
+ --text_only_weight=0.1 \
+ --quantizer=vq \
+ --ckpt_postfix=lora_r1_a2_drop.1_qk \
  --deepspeed \
  --zero_stage=2 \
- --wandb_log \
- --text_only_weight=0.1 \
- --resume \
+ --save_ckpt \
+ --lora_target_modules=q_proj,k_proj \
+ --lora_r=1 \
+ --lora_alpha=2 \
+ --lora_dropout=0.1 \
+#  --wandb_log \
+#  --resume \
 #  --offload_optimizer \
 #  --zero_stage=3 \
 #  --offload_params \

@@ -26,6 +26,12 @@ class MultimodalConfig:
     use_cls_head: bool = False  # Whether to use a classification head instead of LM head and generate tokens
     num_classes: int = 2  # Number of classes for classification head
 
+    # LoRA hyperparameters (used when peft_tune=True)
+    lora_r: int = 8  # LoRA rank
+    lora_alpha: int = 16  # LoRA alpha (scaling factor)
+    lora_dropout: float = 0.1  # LoRA dropout rate
+    lora_target_modules: str = "default"  # Target modules for LoRA; "default" lets PEFT auto-select, or provide a tuple/list of module names
+
     temperature: float = 1
     top_p: float = None
     top_k: int = None
@@ -36,8 +42,8 @@ class MultimodalLLM(nn.Module):
         self.config = config
         
         # Load the base Hugging Face model and tokenizer
-        if config.base_model == 'gpt2':
-            self.base_model = GPT2LMHeadModel.from_pretrained('gpt2')
+        if 'gpt2' in config.base_model.lower():
+            self.base_model = GPT2LMHeadModel.from_pretrained(config.base_model)
         elif 'qwen' in config.base_model.lower():
             self.base_model = Qwen3ForCausalLM.from_pretrained(config.base_model, trust_remote_code=True)
         else:
@@ -70,8 +76,8 @@ class MultimodalLLM(nn.Module):
         # and use the paired data to do fine-tuning (loss only computed on text tokens so no need to produce fMRI tokens)
         if config.use_fmri_lm_head:
             self._add_fmri_lm_head()
-        else:
-            self._resize_output_layer()
+        # else:
+        #     self._resize_output_layer()
 
         # Setup special tokens for models that need them
         if self.tokenizer.pad_token is None:
@@ -99,21 +105,30 @@ class MultimodalLLM(nn.Module):
         Args:
             adapter_name: Name for the LoRA adapter (default: "default")
         """
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        # target_modules = [ "q_proj", "k_proj"]
-        if 'qwen' in self.config.base_model.lower():
-            # peft_config = LoraConfig(task_type="CAUSAL_LM", r=16, lora_alpha=32, lora_dropout=0.05, target_modules=target_modules)
-            peft_config = LoraConfig(task_type="CAUSAL_LM", r=8, lora_alpha=16, lora_dropout=0.1, target_modules=target_modules)
-        else:
-            peft_config = LoraConfig(task_type="CAUSAL_LM", r=16, lora_alpha=32, lora_dropout=0.05)
+        lora_kwargs = dict(
+            task_type="CAUSAL_LM",
+            r=self.config.lora_r,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+        )
+
+        # When lora_target_modules is "default", omit target_modules so PEFT auto-selects
+        if self.config.lora_target_modules != ["default"]:
+            lora_kwargs["target_modules"] = list(self.config.lora_target_modules)
+        
+        peft_config = LoraConfig(**lora_kwargs)
+        print(f"LoRA config: r={self.config.lora_r}, alpha={self.config.lora_alpha}, "
+              f"dropout={self.config.lora_dropout}, target_modules={self.config.lora_target_modules}")
         
         # Check if this is the first adapter
         if not hasattr(self.base_model, 'peft_config'):
             # First adapter - use get_peft_model
+            assert not self.config.freeze_pretrained_lora, "Cannot freeze pretrained LoRA parameters when applying the first adapter"
             self.base_model = get_peft_model(self.base_model, peft_config)
             print(f"Applied LoRA adapter '{adapter_name}' to the base model (first adapter)")
         else:
             # Additional adapter - use add_adapter
+            assert self.config.freeze_pretrained_lora, "Must freeze pretrained LoRA parameters to add a new adapter on top"
             self.base_model.add_adapter(adapter_name, peft_config)
             self.base_model.set_adapter(adapter_name)
             print(f"Added LoRA adapter '{adapter_name}' to the base model")

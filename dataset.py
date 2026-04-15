@@ -179,9 +179,7 @@ class fMRITextDataset(fMRIDataSet):
         if 'qwen' in self.lm_name.lower():
             messages = [{'role': 'user', 'content': prompt}]
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            text = prompt + text if not self.is_val else prompt
-        elif 'gpt2' in self.lm_name.lower():
-            raise NotImplementedError
+        text = prompt + text if not self.is_val else prompt
          
         # TODO Here we assume for evaluation the prompts are of the same length to simplify batching; consider dynamic prompt length
         if self.is_val:
@@ -216,9 +214,9 @@ class fMRITextDataset(fMRIDataSet):
         else:
             # unmask the first EOS token (since pad token may also be eos token id)
             eos_pos = (text_input_ids == self.eos_token).nonzero(as_tuple=True)[0]
-            eos_pos = eos_pos[1:] if eos_pos[0] == 0 else eos_pos  # if eos is the first token (bos), ignore it (becuase we already added it in the attention mask)
-            assert len(eos_pos) > 0, f'No eos token found in text: {text}'
-            text_attention_mask[eos_pos[0]] = 1
+            if len(eos_pos) > 0:
+                eos_pos = eos_pos[1:] if eos_pos[0] == 0 else eos_pos  # if eos is the first token (bos), ignore it (becuase we already added it in the attention mask)
+                text_attention_mask[eos_pos[0]] = 1
 
         return X, fmri_attn_mask, text_input_ids, text_attention_mask
   

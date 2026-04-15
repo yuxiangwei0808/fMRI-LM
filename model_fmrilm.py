@@ -1,7 +1,3 @@
-"""
-Copied and Adapted from https://github.com/935963004/NeuroLM
-"""
-
 import inspect
 import torch
 import torch.nn as nn
@@ -11,7 +7,7 @@ from brain_encoder import *
 from model_gpt import MultimodalLLM
 
 
-class MindLM(nn.Module):
+class fMRILM(nn.Module):
 
     def __init__(self,
                  GPT_config,
@@ -20,7 +16,6 @@ class MindLM(nn.Module):
                  freeze_llm=False,
                  num_rois=450,
                  n_embd=768,
-                 eeg_vocab_size=8192,
                  latent_tokens=None,
                  ):
         super().__init__()
@@ -71,10 +66,10 @@ class MindLM(nn.Module):
         """
         if x_brain is not None:
             if self.tune_tokenizer:
-                x_brain = self.tokenizer(x_brain, latent_tokens=self.latent_tokens)
+                x_brain = self.tokenizer(x_brain)
             else:
                 with torch.no_grad():
-                    x_brain = self.tokenizer(x_brain, latent_tokens=self.latent_tokens)
+                    x_brain = self.tokenizer(x_brain)
             x_brain = self.encode_transform_layer(x_brain)
             
             # pos embedding on ROI

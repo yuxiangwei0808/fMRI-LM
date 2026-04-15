@@ -1,28 +1,27 @@
-"""
-Adapted from https://github.com/935963004/NeuroLM
-"""
-
 import os
 import time
 import math
 import argparse
 import logging
 import sys
+import json
 import wandb
 from tqdm import tqdm
 from collections import OrderedDict
 from omegaconf import OmegaConf
 import copy
 import colorlog
+from datetime import datetime
 
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 
-from model_mindlm import MindLM
-from quantizers import *
+from model_fmrilm import fMRILM
+from quantizers import VQ_Align, FSQ_Align
+from brain_encoder import vit_base
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data, fMRITextDataset
 from utils import combine_attn_mask
@@ -93,11 +92,154 @@ def validate_paths(args, logger):
     logger.info("All required paths validated successfully")
 
 
+def simplify_lm_name(lm_name):
+    """Simplify language model name for file/dir naming"""
+    # Extract just the model name after the last '/'
+    if '/' in lm_name:
+        lm_name = lm_name.split('/')[-1]
+    # Remove version numbers and make it more compact
+    # E.g., "Qwen3-0.6B" -> "Qwen3-0.6B", "gpt2-medium" -> "gpt2-medium"
+    return lm_name
+
+
+def auto_generate_names(args):
+    """Auto-generate checkpoint directory and wandb run name based on training configuration.
+    
+    The wandb run name is set to the checkpoint directory basename so they always match.
+    The full configuration (including LoRA hyperparams) is saved to the checkpoint directory
+    via save_args_to_json.
+    """
+    # Simplify LM name
+    lm_short = simplify_lm_name(args.lm_name)
+
+    dataset_name = []
+    for dataset in args.dataset_dir:
+        if 'UKB' in dataset:
+            dataset_name.append('UKB')
+        elif 'HCP' in dataset:
+            dataset_name.append('HCP')
+        elif 'ABCD' in dataset:
+            dataset_name.append('ABCD')
+        else:
+            raise ValueError(f"Unknown dataset in path: {dataset}")
+    dataset_name = '_'.join(dataset_name)
+    dataset_name += f'-{args.norm}' if args.norm else ''
+    
+    # Create descriptor type string
+    desc_str = '_'.join(args.desc_type) if isinstance(args.desc_type, list) else args.desc_type
+    
+    # Create objective weights string
+    objectives = []
+    if args.fmri_only_weight > 0:
+        objectives.append(f"fmri{args.fmri_only_weight}")
+    if args.text_only_weight > 0:
+        objectives.append(f"text{args.text_only_weight}")
+    if args.fmri2text_weight > 0:
+        objectives.append(f"f2t{args.fmri2text_weight}")
+    if args.text2fmri_weight > 0:
+        objectives.append(f"t2f{args.text2fmri_weight}")
+    
+    obj_str = '_'.join(objectives) if objectives else "noobj"
+    
+    # Generate base name
+    base_name = f"{desc_str}_{obj_str}_{lm_short}"
+    base_name += f'_{args.ckpt_postfix}' if args.ckpt_postfix else ''
+    
+    # Add timestamp
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    
+    # Generate checkpoint directory
+    run_name = f"{base_name}_{timestamp}"
+    ckpt_dir = os.path.join("checkpoints", "pretrain", dataset_name, run_name)
+    
+    # wandb run name matches the checkpoint directory basename
+    wandb_runname = run_name
+    
+    return ckpt_dir, wandb_runname
+
+
+def save_args_to_json(args, save_dir):
+    """Save all arguments to a JSON file"""
+    args_dict = vars(args)
+    json_path = os.path.join(save_dir, 'training_args.json')
+    
+    # Convert any non-serializable objects to strings
+    serializable_dict = {}
+    for key, value in args_dict.items():
+        try:
+            json.dumps(value)
+            serializable_dict[key] = value
+        except (TypeError, ValueError):
+            serializable_dict[key] = str(value)
+    
+    with open(json_path, 'w') as f:
+        json.dump(serializable_dict, f, indent=4, sort_keys=True)
+    
+    return json_path
+
+
 def main(args):
+    # Auto-generate checkpoint directory and wandb run name if using defaults.
+    # We must ensure all processes agree on the *same* directory name.
+    # datetime.now() called independently on each process produces slightly
+    # different timestamps, leading to each process creating its own directory.
+    #
+    # Strategy: rank-0 (LOCAL_RANK == 0) generates the name and writes it to a
+    # temporary file; every other rank waits for that file and reads from it.
+    # This works regardless of whether torch.distributed is already initialised.
+    if args.ckpt_dir == 'tmp':
+        import tempfile, time as _time
+
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+
+        if world_size == 1:
+            # Single-process: just generate normally
+            args.ckpt_dir, args.wandb_runname = auto_generate_names(args)
+        else:
+            # Use a shared temp file whose path is deterministic across processes.
+            # We derive it from the job's master port (set by torchrun/accelerate)
+            # so concurrent jobs on the same node don't collide.
+            master_port = os.environ.get('MASTER_PORT', 'default')
+            sync_file = os.path.join(tempfile.gettempdir(), f'brainfm_ckpt_sync_{master_port}.txt')
+
+            if local_rank == 0:
+                ckpt_dir, wandb_runname = auto_generate_names(args)
+                # Write atomically so other ranks don't read a partial file
+                tmp_path = sync_file + '.tmp'
+                with open(tmp_path, 'w') as f:
+                    f.write(f'{ckpt_dir}\n{wandb_runname}\n')
+                os.replace(tmp_path, sync_file)
+                args.ckpt_dir = ckpt_dir
+                args.wandb_runname = wandb_runname
+            else:
+                # Poll until rank 0 has written the file (up to 60 s)
+                deadline = _time.time() + 60
+                while not os.path.exists(sync_file):
+                    if _time.time() > deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for rank-0 to write checkpoint sync file: {sync_file}"
+                        )
+                    _time.sleep(0.1)
+                with open(sync_file, 'r') as f:
+                    lines = f.read().splitlines()
+                args.ckpt_dir = lines[0]
+                args.wandb_runname = lines[1]
+    
+    # Always sync wandb_runname with ckpt_dir basename
+    if args.wandb_runname == 'pretrain':
+        args.wandb_runname = os.path.basename(args.ckpt_dir)
+    
     # Setup logging
     os.makedirs(args.ckpt_dir, exist_ok=True)
     log_file = os.path.join(args.ckpt_dir, 'training.log') if args.ckpt_dir else None
     logger = setup_logging(log_file=log_file)
+    
+    # Save arguments to JSON file (includes LoRA hyperparams from CLI overrides)
+    json_path = save_args_to_json(args, args.ckpt_dir)
+    logger.info(f"Training arguments saved to: {json_path}")
+    logger.info(f"Checkpoint directory: {args.ckpt_dir}")
+    logger.info(f"W&B run name: {args.wandb_runname}")
     
     # Validate paths
     try:
@@ -152,7 +294,7 @@ def main(args):
         logger.info(f"Checkpoint directory created: {args.ckpt_dir}")
         
         if args.wandb_log:
-            run = wandb.init(project=args.wandb_project, name=args.wandb_runname, dir='./wandb', config=vars(args), resume='auto')
+            run = wandb.init(project=args.wandb_project, name=args.wandb_runname, dir='./wandb', config=vars(args))
             run.log_code('.')
 
             artifact = wandb.Artifact(
@@ -217,13 +359,13 @@ def main(args):
                                                    data_cls=fMRITextDataset,
                                                    train_ratio=1,
                                                    val_ratio=0.1,
-                                                   norm='robust', 
+                                                   norm=args.norm, 
                                                    GPT_training=True, 
                                                    patch_size=quantizer_cfg.patch_size, 
                                                    next_time_mask=(args.quantizer != 'titok'),
                                                    descriptor_types=args.desc_type, 
                                                    lm_name=args.lm_name,
-                                                   max_len=512,
+                                                   max_len=600,
                                                    )
         logger.info(f"Loaded datasets - Train: {len(dataset_train)}, Val: {len(dataset_val)}")
     except Exception as e:
@@ -263,7 +405,7 @@ def main(args):
             batch_size=int(1.5 * args.fmri_batch_size),
             num_workers=16,
             pin_memory=True,
-            drop_last=False,
+            drop_last=True if args.deepspeed else False,  # drop_last for DeepSpeed to keep batch counts consistent across ranks
             shuffle=False
         )
         logger.info(f"Data loaders created - Train batches: {len(data_loader_train)}, Val batches: {len(data_loader_val)}")
@@ -280,79 +422,71 @@ def main(args):
         logger.error(f"Failed to load tokenizer checkpoint: {e}")
         raise
 
+    # tokenizer_state_dict = tokenizer_checkpoint['model']
+    tokenizer_state_dict = tokenizer_checkpoint
+    # Clean up state dict
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(tokenizer_state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            tokenizer_state_dict[k[len(unwanted_prefix):]] = tokenizer_state_dict.pop(k)
+    
     if args.quantizer == 'vq':
-        quantizer_cls = VQ
-        prefix = 'VQ'
+        model_cls = VQ_Align
     elif args.quantizer == 'fsq':
-        quantizer_cls = FSQ_Model
-        prefix = 'FSQ'
-    elif args.quantizer == 'titok':
-        quantizer_cls = TiTok
-        prefix = 'TiTok'
+        model_cls = FSQ_Align
 
     # Create tokenizer
-    try:
-        if args.quantizer == 'titok':
-            tokenizer = quantizer_cls(quantizer=quantizer_cfg.quantizer,
-                num_latent_tokens=quantizer_cfg.num_latent_tokens,
-                latent_token_size=quantizer_cfg.latent_token_size,
-                model_size=quantizer_cfg.model_size,
-                image_size=quantizer_cfg.img_size,
-                patch_size=quantizer_cfg.patch_size,
-                codebook_size=quantizer_cfg.codebook_size,
-                commitment_cost=quantizer_cfg.commitment_cost,
-                use_l2_norm=quantizer_cfg.use_l2_norm,
-            )
-        else:
-            tokenizer = quantizer_cls(quantizer_cfg, decoder_out_dim=quantizer_cfg.num_timestamp)
-        tokenizer_state_dict = tokenizer_checkpoint['model']
-        
-        # Clean up state dict
-        unwanted_prefix = '_orig_mod.'
-        for k,v in list(tokenizer_state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                tokenizer_state_dict[k[len(unwanted_prefix):]] = tokenizer_state_dict.pop(k)
-        
-        try:
-            msg = tokenizer.load_state_dict(tokenizer_state_dict, strict=False)
-            assert msg.missing_keys == []
-            logger.info("Tokenizer loaded successfully from checkpoint")
-        except Exception as e:
-            all_keys = list(tokenizer_state_dict.keys())
-            new_dict = OrderedDict()
-            for key in all_keys:
-                if key.startswith(f'{prefix}.'):
-                    new_dict[key[len(prefix) + 1:]] = tokenizer_state_dict[key]
-                elif key.startswith('fmri_model.') and not key.startswith('text_model.'):
-                    new_dict[key[len('fmri_model.'):]] = tokenizer_state_dict[key]
-        
-            msg = tokenizer.load_state_dict(new_dict, strict=False)
-            assert msg.missing_keys == []
-            logger.info("Tokenizer state dict loaded and cleaned successfully")
+    model_align = model_cls(quantizer_cfg, args.lm_name)
+    
+    # try:
+    #     msg = model_align.load_state_dict(tokenizer_state_dict, strict=False)
+    #     missing_keys = [k for k in msg.missing_keys if 'quantizer.' in k or 'VQ.' in k or 'base_model.' in k]
+    #     assert not missing_keys, f"Missing keys when loading tokenizer: {missing_keys}."
+    #     logger.info("Tokenizer loaded successfully from checkpoint")
+    # except Exception as e:
+    #     all_keys = list(tokenizer_state_dict.keys())
+    #     new_dict = OrderedDict()
+    #     for key in all_keys:
+    #         if key.startswith('fmri_model.') and not key.startswith('text_model.'):
+    #             new_dict[key[len('fmri_model.'):]] = tokenizer_state_dict[key]
+    #         elif key.startswith('VQ.'):  # backward compatibility as the module was renamed to quantizer
+    #             cur_key = key.replace('VQ.', 'quantizer.')
+    #             new_dict[cur_key] = tokenizer_state_dict[key]
 
-        latent_tokens = None
-        if args.quantizer == 'titok':
-            latent_tokens = tokenizer.latent_tokens
-
+    #     msg = model_align.load_state_dict(new_dict, strict=False)
+    #     missing_keys = [k for k in msg.missing_keys if 'quantizer.' in k or 'VQ.' in k or 'base_model.' in k]
+    #     assert not missing_keys, f"Missing keys when loading tokenizer: {missing_keys}. Current dict: {list(new_dict.keys())}"
+    #     logger.info("Tokenizer state dict loaded and cleaned successfully")
+    model_align.quantizer.load_state_dict(tokenizer_state_dict, strict=False)
+    
+    if args.quantizer:
+        tokenizer = model_align.quantizer
         tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
+    else:  # continuous tokenizer
+        tokenizer = model_align
+        tokenizer_encoder = copy.deepcopy(tokenizer.base_model)
 
-        tokenizer.eval()
-        logger.info("Tokenizer set to evaluation mode")
-        
-        # Clean up memory
-        tokenizer_checkpoint = None
-        logger.info("Tokenizer checkpoint memory cleaned up")
-    except Exception as e:
-        logger.error(f"Failed to create and load tokenizer: {e}")
-        raise
+    tokenizer.eval()
+    logger.info("Tokenizer set to evaluation mode")
+    
+    # Clean up memory
+    tokenizer_checkpoint = None
+    logger.info("Tokenizer checkpoint memory cleaned up")
+
 
     # Model initialization
     # Check for both DeepSpeed and standard checkpoints
     ckpt_path = os.path.join(args.ckpt_dir, 'ckpt.pt')
+    deepspeed_latest_dir = os.path.join(args.ckpt_dir, 'deepspeed_checkpoint_latest')
     deepspeed_ckpt_dirs = [d for d in os.listdir(args.ckpt_dir) if d.startswith('deepspeed_checkpoint_epoch_') and os.path.isdir(os.path.join(args.ckpt_dir, d))] if os.path.exists(args.ckpt_dir) else []
     
-    if args.deepspeed and len(deepspeed_ckpt_dirs) > 0 and args.resume:
-        # Find the latest DeepSpeed checkpoint
+    if args.deepspeed and os.path.isdir(deepspeed_latest_dir) and args.resume:
+        # Prefer the "latest" rolling checkpoint
+        deepspeed_ckpt_path = deepspeed_latest_dir
+        init_from = 'resume_deepspeed'
+        logger.info(f"Resuming DeepSpeed training from latest checkpoint: {deepspeed_ckpt_path}")
+    elif args.deepspeed and len(deepspeed_ckpt_dirs) > 0 and args.resume:
+        # Backward compat: fall back to epoch-numbered directories
         latest_epoch = max([int(d.split('_')[-1]) for d in deepspeed_ckpt_dirs if d.split('_')[-1].isdigit()])
         deepspeed_ckpt_path = os.path.join(args.ckpt_dir, f'deepspeed_checkpoint_epoch_{latest_epoch}')
         init_from = 'resume_deepspeed'
@@ -364,17 +498,32 @@ def main(args):
         init_from = 'llm'
         logger.info("Initializing from pretrained weights")
 
-    num_tokens = tokenizer.encoder.num_patches
-    num_chans = quantizer_cfg.num_rois if args.quantizer != 'titok' else 1  # TiTok uses vanilla NTP since it produes latent tokens
+    num_tokens = tokenizer_encoder.num_patches
+    num_chans = quantizer_cfg.num_rois
 
     iter_num = 0
     best_f2t_loss = float('inf')
     n_embd = quantizer_cfg.n_embd
-    dropout = 0.0
 
-    lm_cfg.fmri_vocab_size = tokenizer.codebook_size
+    fmri_vocab_size = tokenizer.codebook_size if hasattr(tokenizer, 'codebook_size') else 0
+    if fmri_vocab_size:
+        assert lm_cfg.fmri_vocab_size == fmri_vocab_size, "fmri_vocab_size in lm_cfg does not match tokenizer codebook size"
     lm_cfg.base_model = args.lm_name
-    model_args = lm_cfg
+
+    # Override LoRA hyperparameters from CLI args (if provided)
+    if args.no_lora:
+        lm_cfg.peft_tune = False
+    if args.lora_r is not None:
+        lm_cfg.lora_r = args.lora_r
+    if args.lora_alpha is not None:
+        lm_cfg.lora_alpha = args.lora_alpha
+    if args.lora_dropout is not None:
+        lm_cfg.lora_dropout = args.lora_dropout
+    if args.lora_target_modules is not None:
+        lm_cfg.lora_target_modules = args.lora_target_modules
+
+    # Convert to plain dict for consistent serialization in checkpoints
+    model_args = OmegaConf.to_container(lm_cfg, resolve=True)
 
     try:
         if init_from == 'resume_deepspeed':
@@ -382,7 +531,11 @@ def main(args):
             metadata_path = os.path.join(deepspeed_ckpt_path, 'metadata.pt')
             if os.path.exists(metadata_path):
                 metadata = torch.load(metadata_path, map_location='cpu', weights_only=False)
-                model_args = metadata['model_args']
+                ckpt_model_args = metadata['model_args']
+                # Ensure it's a plain dict (older checkpoints may contain OmegaConf DictConfig)
+                if hasattr(ckpt_model_args, '_metadata') or hasattr(ckpt_model_args, '_iter_ex'):
+                    ckpt_model_args = OmegaConf.to_container(ckpt_model_args, resolve=True)
+                model_args = dict(ckpt_model_args)
                 iter_num = metadata['iter_num']
                 start_epoch = metadata['epoch'] + 1
                 best_f2t_loss = metadata.get('best_f2t_loss', float('inf'))
@@ -397,8 +550,8 @@ def main(args):
             temp_peft_flag = gptconf.peft_tune
             gptconf.peft_tune = False
             
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm,
-                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm,
+                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd)
             
             # For DeepSpeed, we need to apply LoRA BEFORE prepare() if checkpoint has it
             # so the model structure matches when accelerator.load_state() is called
@@ -413,7 +566,11 @@ def main(args):
         elif init_from == 'resume':
             logger.info(f"Resuming training from {args.ckpt_dir}")
             checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            model_args = checkpoint['model_args']
+            ckpt_model_args = checkpoint['model_args']
+            # Ensure it's a plain dict (older checkpoints may contain OmegaConf DictConfig)
+            if hasattr(ckpt_model_args, '_metadata') or hasattr(ckpt_model_args, '_iter_ex'):
+                ckpt_model_args = OmegaConf.to_container(ckpt_model_args, resolve=True)
+            model_args = dict(ckpt_model_args)
             
             gptconf = MultimodalConfig(**model_args)
             # Check if the checkpoint was trained with PEFT
@@ -423,8 +580,8 @@ def main(args):
             temp_peft_flag = gptconf.peft_tune
             gptconf.peft_tune = False
             
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm, 
-                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm, 
+                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd)
 
             # If checkpoint has LoRA, apply it BEFORE loading to match structure
             if use_peft:
@@ -459,8 +616,8 @@ def main(args):
             logger.info(f"Initializing from pretrained weights: {lm_cfg.base_model}")
             # gptconf = GPTConfig(**model_args)
             gptconf = MultimodalConfig(**model_args)
-            model = MindLM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm,
-                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd, eeg_vocab_size=tokenizer.codebook_size, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, args.freeze_llm,
+                            num_rois=quantizer_cfg.num_rois, n_embd=n_embd)
             start_epoch = 0
             logger.info("Model initialized from LLM")
     except Exception as e:
@@ -482,7 +639,6 @@ def main(args):
             # checkpoint variable is guaranteed to exist from the 'resume' block above
             optimizer.load_state_dict(checkpoint['optimizer'])
             logger.info("Optimizer state loaded from checkpoint")
-            del checkpoint  # free up memory
         logger.info("Optimizer configured successfully")
     except Exception as e:
         logger.error(f"Failed to configure optimizer: {e}")
@@ -522,13 +678,24 @@ def main(args):
         logger.error(f"Failed to prepare with accelerator: {e}")
         raise
 
-    # Learning rate scheduler
+    # Learning rate scheduler: cosine with optional linear warmup
     try:
+        total_steps = args.epochs * len(data_loader_train) // args.gradient_accumulation_steps
         num_training_steps_per_epoch = len(data_loader_train)
-        lr_scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=num_training_steps_per_epoch, T_mult=1, eta_min=args.min_lr
-        )
-        logger.info(f"Learning rate scheduler configured - steps per epoch: {num_training_steps_per_epoch}")
+        if args.warmup_epochs > 0:
+            warmup_steps = args.warmup_epochs * num_training_steps_per_epoch // args.gradient_accumulation_steps
+            warmup_scheduler = LinearLR(optimizer, start_factor=1e-2, total_iters=warmup_steps)
+            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=args.min_lr)
+            lr_scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        else:
+            lr_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_lr)
+
+        if init_from == 'resume' and 'lr_scheduler' in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            logger.info("LR scheduler state loaded from checkpoint")
+            del checkpoint  # free up memory (moved here from optimizer block)
+
+        logger.info(f"Learning rate scheduler configured - steps per epoch: {num_training_steps_per_epoch}, warmup epochs: {args.warmup_epochs}")
     except Exception as e:
         logger.error(f"Failed to configure learning rate scheduler: {e}")
         raise
@@ -557,6 +724,7 @@ def main(args):
         loss_fmri, loss_text, loss_f2t = 0, 0, 0
         
         if args.fmri_only_weight > 0:
+            assert Y_fmri is not None, "Y_fmri must be provided for fmri_only training"
             loss_fmri, log_fmri, _ = model(X_fmri, Y_fmri, None, None, fmri_gpt_mask)
         
         if args.text_only_weight > 0:
@@ -599,19 +767,23 @@ def main(args):
                     Y_fmri = torch.full((X_fmri.size(0), num_tokens),  
                                         fill_value=-1 if gptconf.use_fmri_lm_head else -1-vocab_size,
                                         device=accelerator.device)
-                    # Handle both DeepSpeed (not wrapped) and DDP (wrapped with .module)
-                    if args.deepspeed or accelerator.num_processes == 1:
-                        codebook_indices = tokenizer.get_codebook_indices(X_fmri)
-                    else:
-                        codebook_indices = tokenizer.module.get_codebook_indices(X_fmri)
+                    
+                    if args.quantizer:
+                        # Handle both DeepSpeed (not wrapped) and DDP (wrapped with .module)
+                        if args.deepspeed or accelerator.num_processes == 1:
+                            codebook_indices = tokenizer.get_codebook_indices(X_fmri)
+                        else:
+                            codebook_indices = tokenizer.module.get_codebook_indices(X_fmri)
 
-                    # next timestamp prediction; use the ROIs from the prev timestamp to predict ROIs for the next timestamp
-                    # TODO this assume a 1v1 correspondance between the ROI from adjacent timestamp, try generalize this?
-                    if num_tokens == num_chans:
-                        Y_fmri = codebook_indices
+                        # next timestamp prediction; use the ROIs from the prev timestamp to predict ROIs for the next timestamp
+                        # TODO this assume a 1v1 correspondance between the ROI from adjacent timestamp, try generalize this?
+                        if num_tokens == num_chans:
+                            Y_fmri = codebook_indices
+                        else:
+                            for i in range(len(codebook_indices)):
+                                Y_fmri[i, :num_tokens - num_chans] = codebook_indices[i, num_chans:num_tokens]
                     else:
-                        for i in range(len(codebook_indices)):
-                            Y_fmri[i, :num_tokens - num_chans] = codebook_indices[i, num_chans:num_tokens]
+                        Y_fmri = None
 
             # DeepSpeed handles gradient accumulation internally, don't use accelerator.accumulate()
             if args.deepspeed:
@@ -775,7 +947,8 @@ def main(args):
                 # For DeepSpeed, use accelerator.save_state() which handles ZeRO stages correctly
                 # This will save the full model state including optimizer and scheduler states
                 # accelerator.save_state() internally handles synchronization across all processes
-                checkpoint_dir = os.path.join(args.ckpt_dir, f'deepspeed_checkpoint_epoch_{epoch}')
+                # Overwrite the same "latest" directory each epoch to avoid disk bloat
+                checkpoint_dir = os.path.join(args.ckpt_dir, 'deepspeed_checkpoint_latest')
                 accelerator.save_state(checkpoint_dir)
                 
                 # Only main process saves metadata
@@ -840,6 +1013,7 @@ def main(args):
                     checkpoint = {
                         'model': unwrapped_model.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
                         'model_args': model_args,
                         'iter_num': iter_num,
                         'epoch': epoch,
@@ -968,13 +1142,7 @@ def evaluate(model, tokenizer, dataloader, accelerator, args, logger, vocab_size
             # Collect all texts across batches
             all_generated_texts.extend(cleaned_generated_texts)
             all_reference_texts.extend(reference_texts)
-            
-            # if batch_idx % 10 == 0:
-            #     logger.info(f"Processed {batch_idx + 1}/{len(dataloader)} batches")
-            #     # Log example
-            #     if len(generated_texts) > 0:
-            #         logger.info(f"Example generated: {generated_texts[0][:100]}...")
-            #         logger.info(f"Example reference: {reference_texts[0][:100]}...")
+
     
     # Gather texts from all processes (only main process gets the full data)
     if accelerator.num_processes > 1:
@@ -1015,22 +1183,24 @@ def get_args():
         return arg.split(',')
     parser = argparse.ArgumentParser('NeuroLM training script', add_help=False)
     parser.add_argument('--dataset_dir', default=['data/UKB/fmri/TianS3/'], type=list_of_strs, help='path to the dataset directory')
+    parser.add_argument('--norm', type=str, default='robust', help='normalization method')
     parser.add_argument('--tokenizer_path', default='checkpoints/tokenizer/UKB_ABCD_robust/VQ_Align-ViT_base-p160-Qwen3-0.6B/ckpt.pt', help='path where tokenizer is')
-    parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
+    parser.add_argument('--ckpt_dir', default='tmp', help='path where to save. If set to "tmp" (default), will auto-generate based on training config')
+    parser.add_argument('--ckpt_postfix', default='', help='optional postfix to add to checkpoint directory name')
     parser.add_argument('--resume', default=False, action='store_true', help='resume from the latest checkpoint')
-    parser.add_argument('--log_interval', default=10, type=int)
+    parser.add_argument('--log_interval', default=15, type=int)
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='BrainFM_pretrain')
-    parser.add_argument('--wandb_runname', default='pretrain')
+    parser.add_argument('--wandb_runname', default='pretrain', help='W&B run name. If set to "pretrain" (default), will auto-generate based on training config')
 
     # training args
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
     parser.add_argument('--fmri_batch_size', default=1, type=int)
     parser.add_argument('--text_batch_size', default=1, type=int)
-    parser.add_argument('--epochs', default=20, type=int)
-    parser.add_argument('--warmup_epochs', default=2, type=int)
+    parser.add_argument('--epochs', default=30, type=int)
+    parser.add_argument('--warmup_epochs', default=0, type=int)
     parser.add_argument('--save_ckpt', default=False, action=argparse.BooleanOptionalAction, help='whether to save checkpoints')
-    parser.add_argument('--save_ckpt_freq', default=10, type=int)
+    parser.add_argument('--save_ckpt_freq', default=15, type=int)
     parser.add_argument('--tune_tokenizer', action='store_true', help='whether to finetune the tokenizer during training', default=False)
     parser.add_argument('--freeze_llm', action='store_true', help='whether to freeze the LLM during training', default=False)
 
@@ -1042,21 +1212,29 @@ def get_args():
     parser.add_argument('--fmri2text_weight', type=float, help='weight for fMRI -> text NTP objective', default=1)
     parser.add_argument('--text2fmri_weight', type=float, help='weight for text -> fMRI NTP objective', default=0)
 
-    parser.add_argument('--quantizer', type=str, default='vq')
+    parser.add_argument('--quantizer', type=str, default='')
     parser.add_argument('--cfg_path', type=str, default='configs/vit_base_qwen_p160.yaml', help='path to the TiTok config file',)
 
-    parser.add_argument('--learning_rate', type=float, default=6e-4, metavar='LR',
-                        help='learning rate (default: 6e-4)')
-    parser.add_argument('--min_lr', type=float, default=6e-5)
-    parser.add_argument('--weight_decay', type=float, default=1e-1,
-                        help='weight decay (default: 1e-1)')
+    # LoRA hyperparameters (override YAML defaults when provided)
+    parser.add_argument('--no_lora', action='store_true', default=False, help='disable LoRA and fine-tune the entire model')
+    parser.add_argument('--lora_r', type=int, default=None, help='LoRA rank (default: use YAML config)')
+    parser.add_argument('--lora_alpha', type=int, default=None, help='LoRA alpha scaling factor (default: use YAML config)')
+    parser.add_argument('--lora_dropout', type=float, default=None, help='LoRA dropout rate (default: use YAML config)')
+    parser.add_argument('--lora_target_modules', type=list_of_strs, default=None,
+                        help='Comma-separated list of target modules for LoRA, e.g. "q_proj,v_proj" (default: use YAML config)')
+
+    parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',
+                        help='learning rate (default: 1e-3)')
+    parser.add_argument('--min_lr', type=float, default=1e-5)
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='weight decay (default: 1e-4)')
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.95)
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='clip gradients at this value, or disable if == 0.0')
     parser.add_argument('--decay_lr', default=True, action='store_false')
     parser.add_argument('--seed', default=1337, type=int)
-    parser.add_argument('--val_interval', default=10, type=int, help='number of epochs between validations')
+    parser.add_argument('--val_interval', default=100, type=int, help='number of epochs between validations')
 
     # DeepSpeed optimization args
     parser.add_argument('--deepspeed', action='store_true', default=False, help='use DeepSpeed for training')

@@ -105,7 +105,16 @@ def _find_adni_files(root_dir: str) -> Iterable[Tuple[str, str, str]]:
     metadata = pd.read_csv('data/ADNI/fmri/metadata.csv')
 
     for i, row in metadata.iterrows():
-        yield row['fmri_path'], row['subject_id'], os.path.basename(os.path.dirname(row['session_path']))
+        fmri_path = row['fmri_path'].split('/')[1:]
+        assert fmri_path[6] == 'ADNI'
+        session_id = '-'.join(fmri_path[7:11])
+        yield row['fmri_path'], row['subject_id'], session_id
+
+def _find_oasis_files(root_dir: str) -> Iterable[Tuple[str, str, str]]:
+    metadata = pd.read_csv('data/OASIS3/metadata.csv')
+
+    for i, row in metadata.iterrows():
+        yield row['fmri_path'], row['subject_id'], row['session_id']
 
 def _find_abcd_files(root_dir: str):
     suffix = "SmNpdmcf_prest.nii"
@@ -168,6 +177,12 @@ def _find_abide2_files(root_dir: str) -> Iterable[Tuple[str, str, str]]:
 
         yield func_path, subject, "ses01"
 
+def _find_blsa_files(root_dir: str) -> Iterable[Tuple[str, str, str]]:
+    metadata = pd.read_csv('data/BLSA/fmri/metadata.csv')
+    for i, row in metadata.iterrows():
+        yield row['fmri_path'], row['subject_id'], row['session_id']
+
+
 DATASETS: Dict[str, DatasetConfig] = {
     "hcp": DatasetConfig(
         name="hcp",
@@ -221,7 +236,7 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_hdf5_name="data_resampled.h5",
         metadata_filename="EHBS_fMRI_metadata.csv",
         default_atlas_name="TianS3",
-        source_tr=0.8,
+        source_tr=1.89,
         target_tr=2.0,
         clip_length=200,
         standardize=False,
@@ -236,13 +251,28 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_hdf5_name="data_resampled.h5",
         metadata_filename="ADNI_fMRI_metadata.csv",
         default_atlas_name="TianS3",
-        source_tr=2,
+        source_tr=3.0,
         target_tr=2.0,
         clip_length=None,
         standardize=False,
         gather_supported=False,
         default_max_voxels=None,
         file_finder=_find_adni_files,
+    ),
+    'oasis3': DatasetConfig(
+        name='oasis3',
+        default_root_dir="/data/qneuromark/Data/OASIS/OASIS3/Data_BIDS/Raw_Data",
+        default_output_dir="./oasis3_preprocessing_output",
+        default_hdf5_name="data_resampled.h5",
+        metadata_filename="OASIS3_fMRI_metadata.csv",
+        default_atlas_name="TianS3",
+        source_tr=2.2,
+        target_tr=2.0,
+        clip_length=None,
+        standardize=False,
+        gather_supported=False,
+        default_max_voxels=None,
+        file_finder=_find_oasis_files,
     ),
     'abcd': DatasetConfig(
         name='abcd',
@@ -289,6 +319,21 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_max_voxels=None,
         file_finder=_find_abide2_files,
     ),
+    'blsa': DatasetConfig(
+        name='blsa',
+        default_root_dir='/data/qneuromark/Data/BLSA/fmri/data',
+        default_output_dir="./blsa_preprocessing_output",
+        default_hdf5_name="data_resampled.h5",
+        metadata_filename="BLSA_fMRI_metadata.csv",
+        default_atlas_name="TianS3",
+        source_tr=2.0,
+        target_tr=2.0,
+        clip_length=None,
+        standardize=False,
+        gather_supported=False,
+        default_max_voxels=None,
+        file_finder=_find_blsa_files,
+    )
 }
 
 
@@ -382,6 +427,13 @@ def parse_arguments() -> argparse.Namespace:
         default="false",
         help="Whether to z-score parcel signals (default: dataset-specific).",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["timeseries", "fc"],
+        default="timeseries",
+        help="Processing mode: 'timeseries' for time series extraction (default), 'fc' for functional connectivity.",
+    )
     return parser.parse_args()
 
 
@@ -472,6 +524,7 @@ def process_single_file(args: Tuple) -> Dict[str, object]:
         gather_voxel,
         max_voxels,
         dataset_key,
+        mode,
     ) = args
 
     fmri_img = nib.load(file_path)
@@ -488,6 +541,25 @@ def process_single_file(args: Tuple) -> Dict[str, object]:
         else:
             masker = NiftiLabelsMasker(labels_img=atlas_img, standardize=standardize)
             time_series = masker.fit_transform(fmri_img)  # (time, rois)
+
+    # For functional connectivity mode, compute correlation matrix
+    if mode == "fc":
+        corr_matrix = np.corrcoef(time_series.T)  # (n_parcels, n_parcels)
+        if np.isnan(corr_matrix).any():
+            print(f"Warning: NaN values found in correlation matrix for file {file_path}. Replacing with zeros.")
+            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+        np.fill_diagonal(corr_matrix, 1)
+        file_id = f"{subject}_{session}_{Path(file_path).name}"
+        return {
+            "file_id": file_id,
+            "subject": subject,
+            "session": session,
+            "file_path": file_path,
+            "dataset": dataset_key,
+            "time_series": corr_matrix.astype(np.float32),
+            "success": True,
+            "error": None,
+        }
 
     # Resample expects time as last dimension
     if source_tr != target_tr:
@@ -517,10 +589,13 @@ def save_batch_to_hdf5(
     batch_results: List[Dict[str, object]],
     batch_size: int,
     logger: logging.Logger,
+    mode: str = "timeseries",
 ) -> int:
     saved = 0
     with h5py.File(hdf5_path, "a") as f:
-        time_group = f.require_group("time_series")
+        # Use different group name based on mode
+        group_name = "fc" if mode == "fc" else "time_series"
+        time_group = f.require_group(group_name)
         meta_group = f.require_group("metadata")
         next_index = int(f.attrs.get("next_index", 0))
 
@@ -611,31 +686,44 @@ def create_final_numpy_array(
     output_dir: Path,
     atlas_name: str,
     logger: logging.Logger,
+    mode: str = "timeseries",
 ) -> None:
     logger.info("Creating consolidated NumPy array from %s", hdf5_path)
     if not hdf5_path.exists():
         logger.error("HDF5 file %s does not exist", hdf5_path)
         return
 
+    # Determine which group to read from based on mode
+    group_name = "fc" if mode == "fc" else "time_series"
+
     with h5py.File(hdf5_path, "r") as f:
-        if "time_series" not in f:
-            logger.error("No time_series group in %s", hdf5_path)
+        if group_name not in f:
+            logger.error("No %s group in %s", group_name, hdf5_path)
             return
-        time_group = f["time_series"]
+        time_group = f[group_name]
         dataset_names = sorted(time_group.keys())
         if not dataset_names:
-            logger.warning("No datasets found inside time_series group")
+            logger.warning("No datasets found inside %s group", group_name)
             return
         first = time_group[dataset_names[0]][:]
-        feature_dim = first.shape[1]
-        max_time = max(time_group[name].shape[0] for name in dataset_names)
+        
+        if mode == "fc":
+            # FC matrices are 2D (n_parcels, n_parcels)
+            stacked = np.full((len(dataset_names), first.shape[0], first.shape[1]), np.nan, dtype=np.float32)
+            for idx, name in enumerate(tqdm(dataset_names, desc="Consolidating")):
+                data = time_group[name][:]
+                stacked[idx] = data
+        else:
+            # Time series are 2D (features, time)
+            feature_dim = first.shape[1] if first.ndim > 1 else 1
+            max_time = max(time_group[name].shape[0] for name in dataset_names)
+            stacked = np.full((len(dataset_names), max_time, feature_dim), np.nan, dtype=np.float32)
+            for idx, name in enumerate(tqdm(dataset_names, desc="Consolidating")):
+                data = time_group[name][:]
+                stacked[idx, : data.shape[0], : data.shape[1]] = data
 
-        stacked = np.full((len(dataset_names), max_time, feature_dim), np.nan, dtype=np.float32)
-        for idx, name in enumerate(tqdm(dataset_names, desc="Consolidating")):
-            data = time_group[name][:]
-            stacked[idx, : data.shape[0], : data.shape[1]] = data
-
-    output_path = output_dir / f"fMRI_{atlas_name}_consolidated.npy"
+    suffix = "fc" if mode == "fc" else "timeseries"
+    output_path = output_dir / f"fMRI_{atlas_name}_{suffix}_consolidated.npy"
     np.save(output_path, stacked)
     logger.info("Consolidated array saved to %s with shape %s", output_path, stacked.shape)
 
@@ -665,7 +753,10 @@ def main() -> None:
     output_dir = Path(args.output_dir or config.default_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    hdf5_file = output_dir / (args.hdf5_name or config.default_hdf5_name)
+    hdf5_name = args.hdf5_name or config.default_hdf5_name
+    if args.mode == "fc":
+        hdf5_name = hdf5_name.replace("_resampled", "_fc")
+    hdf5_file = output_dir / hdf5_name
     metadata_file = output_dir / (args.metadata_name or config.metadata_filename)
     progress_file = output_dir / f"progress_{config.name}.json"
     error_log_file = output_dir / f"errors_{config.name}.log"
@@ -693,15 +784,18 @@ def main() -> None:
     if gather_parcel_voxel and max_voxels is None:
         raise ValueError("max_voxels must be provided for gather_parcel_voxel mode")
 
+    mode = args.mode
+
     logger.info("Dataset: %s", config.name)
     logger.info("Root dir: %s", root_dir)
     logger.info("Output dir: %s", output_dir)
     logger.info("HDF5 file: %s", hdf5_file)
     logger.info("Metadata file: %s", metadata_file)
     logger.info("Processes: %d", n_processes)
+    logger.info("Mode: %s", mode)
 
     if args.consolidate:
-        create_final_numpy_array(hdf5_file, output_dir, atlas_name, logger)
+        create_final_numpy_array(hdf5_file, output_dir, atlas_name, logger, mode)
         return
 
     logger.info("Collecting fMRI files...")
@@ -740,6 +834,7 @@ def main() -> None:
         gather_parcel_voxel,
         max_voxels,
         config.name,
+        mode,
     )
 
     total_files = len(remaining_files)
@@ -766,6 +861,7 @@ def main() -> None:
                 params[4],
                 params[5],
                 params[6],
+                params[7],
             )
             for file_path, subject, session in batch
         ]
@@ -779,7 +875,7 @@ def main() -> None:
         failed = [res for res in batch_results if not res["success"]]
 
         if successful:
-            saved = save_batch_to_hdf5(hdf5_file, successful, batch_size, logger)
+            saved = save_batch_to_hdf5(hdf5_file, successful, batch_size, logger, mode)
             update_metadata_csv(metadata_file, successful, logger)
             processed_file_ids.update(res["file_id"] for res in successful)
             progress["processed_files"] = list(processed_file_ids)
