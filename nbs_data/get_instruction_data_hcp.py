@@ -1,3 +1,5 @@
+import os
+import argparse
 import pandas as pd
 import polars as pl
 import h5py
@@ -6,9 +8,30 @@ from tqdm import tqdm
 from typing import Dict, Any, Optional
 
 
-def get_targets(data_path):
-    df1 = pl.read_csv('/data/qneuromark/Data/HCP/Data_info/HCP_demo.csv')
-    df2 = pl.read_csv('/data/qneuromark/Data/HCP/Data_info/RESTRICTED_12_2_2020_5_36_9.csv', ignore_errors=True)
+def get_targets(data_path, demographics_csv: str = None, restricted_csv: str = None):
+    """Extract subject targets from the HCP HDF5 file.
+
+    Args:
+        data_path:        Path to the HCP HDF5 data file.
+        demographics_csv: Path to the HCP demographics CSV (unrestricted data).
+                          Can also be set via HCP_DEMO_CSV env var.
+        restricted_csv:   Path to the HCP restricted-access phenotypic CSV.
+                          Can also be set via HCP_RESTRICTED_CSV env var.
+                          Note: access to this file requires a signed HCP data
+                          use agreement; do NOT commit this file to version control.
+    """
+    if demographics_csv is None:
+        demographics_csv = os.environ.get("HCP_DEMO_CSV")
+    if restricted_csv is None:
+        restricted_csv = os.environ.get("HCP_RESTRICTED_CSV")
+    if not demographics_csv or not restricted_csv:
+        raise ValueError(
+            "HCP CSV paths are required. "
+            "Provide them via --demographics_csv / --restricted_csv arguments "
+            "or the HCP_DEMO_CSV / HCP_RESTRICTED_CSV environment variables."
+        )
+    df1 = pl.read_csv(demographics_csv)
+    df2 = pl.read_csv(restricted_csv, ignore_errors=True)
 
     df = df1.join(df2, left_on='Subject', right_on='Subject', how='inner')
     
@@ -145,8 +168,18 @@ class fMRITextGenerator:
 
 
 if __name__ == '__main__':
-    # df = get_targets('data/HCP/fmri/TianS3/data_resampled_split180*2.h5')
+    parser = argparse.ArgumentParser(description='Generate HCP instruction data')
+    parser.add_argument('--demographics_csv', type=str, default=None,
+                        help='Path to HCP demographics CSV (or set HCP_DEMO_CSV env var)')
+    parser.add_argument('--restricted_csv', type=str, default=None,
+                        help='Path to HCP restricted-access CSV (or set HCP_RESTRICTED_CSV env var)')
+    parser.add_argument('--data_path', type=str,
+                        default='data/HCP/fmri/TianS3/data_resampled_split180*2.h5')
+    args = parser.parse_args()
 
+    # df = get_targets(args.data_path,
+    #                  demographics_csv=args.demographics_csv,
+    #                  restricted_csv=args.restricted_csv)
     df = pd.read_csv('data/HCP/fmri/metadata_with_text_medical.csv')
     df['fluid_composite_z'] = (df['fluid_composite'] - df['fluid_composite'].mean()) / df['fluid_composite'].std()
     text_gen = fMRITextGenerator()

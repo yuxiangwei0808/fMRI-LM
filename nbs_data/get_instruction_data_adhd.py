@@ -1,3 +1,5 @@
+import os
+import argparse
 import pandas as pd
 import polars as pl
 import h5py
@@ -5,8 +7,22 @@ import numpy as np
 from tqdm import tqdm
 from typing import Dict, Any, Optional
 
-def get_targets():
-    df = pd.read_excel('/data/qneuromark/Data/ADHD/ADHD200/Data_info/All_combined_phenotypic.xlsx')
+def get_targets(phenotypic_xlsx: str = None):
+    """Extract subject targets from the ADHD200 phenotypic file.
+
+    Args:
+        phenotypic_xlsx: Path to the ADHD200 combined phenotypic Excel file.
+                         Can also be set via ADHD200_PHENOTYPIC_XLSX env var.
+    """
+    if phenotypic_xlsx is None:
+        phenotypic_xlsx = os.environ.get("ADHD200_PHENOTYPIC_XLSX")
+    if not phenotypic_xlsx:
+        raise ValueError(
+            "ADHD200 phenotypic file path is required. "
+            "Provide it via the --phenotypic_xlsx argument or the "
+            "ADHD200_PHENOTYPIC_XLSX environment variable."
+        )
+    df = pd.read_excel(phenotypic_xlsx)
 
     df['QC_Rest_1'] = df['QC_Rest_1'].fillna(0).astype(int)
     df['QC_Rest_2'] = df['QC_Rest_2'].fillna(0).astype(int)
@@ -133,7 +149,13 @@ class fMRITextGenerator:
 
 
 if __name__ == '__main__':
-    # get_targets()
+    parser = argparse.ArgumentParser(description='Generate ADHD200 instruction data')
+    parser.add_argument('--phenotypic_xlsx', type=str, default=None,
+                        help='Path to ADHD200 combined phenotypic Excel file '
+                             '(or set ADHD200_PHENOTYPIC_XLSX env var)')
+    args = parser.parse_args()
+
+    # get_targets(phenotypic_xlsx=args.phenotypic_xlsx)
 
     df = pd.read_csv('data/ADHD200/fmri/metadata_with_text_medical.csv')
     df.loc[df['Verbal IQ'] < 0, 'Verbal IQ'] = np.nan

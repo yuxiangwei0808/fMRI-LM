@@ -1,0 +1,61 @@
+# ── Data files ─────────────────────────────────────────────────────────────
+# Never commit raw or processed participant data.
+data/
+*.h5
+*.hdf5
+*.csv
+*.xlsx
+*.xls
+*.mat
+*.pkl
+*.nii
+*.nii.gz
+
+# ── Credentials & secrets ──────────────────────────────────────────────────
+.env
+*.env
+.env.*
+secrets.yaml
+secrets.json
+*_secrets.*
+# Catch any accidentally embedded key files
+*api_key*
+*apikey*
+
+# ── Checkpoints & model weights ────────────────────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# ── Python artefacts ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Jupyter / IPython ──────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS artefacts ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs & outputs ─────────────────────────────────────────────────────────
+*.log
+wandb/
+runs/
+outputs/

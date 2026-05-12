@@ -1,11 +1,27 @@
+import os
+import argparse
 import pandas as pd
 import h5py
 import numpy as np
 from tqdm import tqdm
 from typing import Dict, Any, Optional
 
-def get_targets():
-    df = pd.read_csv('/data/qneuromark/Data/Autism/ABIDE2/Data_info/ABIDEII_Composite_Phenotypic.csv', encoding='latin1')
+def get_targets(phenotypic_csv: str = None):
+    """Extract subject targets from the ABIDE2 phenotypic CSV.
+
+    Args:
+        phenotypic_csv: Path to the ABIDEII Composite Phenotypic CSV file.
+                        Can also be set via ABIDE2_PHENOTYPIC_CSV env var.
+    """
+    if phenotypic_csv is None:
+        phenotypic_csv = os.environ.get("ABIDE2_PHENOTYPIC_CSV")
+    if not phenotypic_csv:
+        raise ValueError(
+            "ABIDE2 phenotypic CSV path is required. "
+            "Provide it via the --phenotypic_csv argument or the "
+            "ABIDE2_PHENOTYPIC_CSV environment variable."
+        )
+    df = pd.read_csv(phenotypic_csv, encoding='latin1')
     df['SITE_ID'] = df['SITE_ID'].fillna('').astype(str)
     df['SUB_ID'] = df['SUB_ID'].fillna('').astype(str)
     site_ids, sub_ids = df['SITE_ID'].values, df['SUB_ID'].values
@@ -127,7 +143,13 @@ class fMRITextGenerator:
         return df_copy
 
 if __name__ == '__main__':
-    # get_targets()
+    parser = argparse.ArgumentParser(description='Generate ABIDE2 instruction data')
+    parser.add_argument('--phenotypic_csv', type=str, default=None,
+                        help='Path to ABIDEII Composite Phenotypic CSV '
+                             '(or set ABIDE2_PHENOTYPIC_CSV env var)')
+    args = parser.parse_args()
+
+    # get_targets(phenotypic_csv=args.phenotypic_csv)
 
     df = pd.read_csv('data/ABIDE2/fmri/metadata_with_text_medical_gpt.csv')
 

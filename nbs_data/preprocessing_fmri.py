@@ -186,7 +186,7 @@ def _find_blsa_files(root_dir: str) -> Iterable[Tuple[str, str, str]]:
 DATASETS: Dict[str, DatasetConfig] = {
     "hcp": DatasetConfig(
         name="hcp",
-        default_root_dir="/data/qneuromark/Data/HCP/Data_BIDS/Preprocess_Data/",
+        default_root_dir="",  # Set via --root_dir or HCP_ROOT env var
         default_output_dir="./hcp_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="HCP_fMRI_metadata.csv",
@@ -201,7 +201,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     "hcp_aging": DatasetConfig(
         name="hcp_aging",
-        default_root_dir="/data/neuromark2/Data/HCP_Aging/Data_BIDS/Raw_Data/",
+        default_root_dir="",  # Set via --root_dir or HCP_AGING_ROOT env var
         default_output_dir="./hcp_aging_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="HCP_Aging_fMRI_metadata.csv",
@@ -216,7 +216,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     "ukb": DatasetConfig(
         name="ukb",
-        default_root_dir="/data/qneuromark/Data/UKBiobank/Data_BIDS/Preprocess_Data/",
+        default_root_dir="",  # Set via --root_dir or UKB_ROOT env var
         default_output_dir="./ukb_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="UKBiobank_fMRI_metadata.csv",
@@ -231,7 +231,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'ehbs': DatasetConfig(
         name='ehbs',
-        default_root_dir="/data/qneuromark/Data/Emory_Healthy_Brain/rest/",
+        default_root_dir="",  # Set via --root_dir or EHBS_ROOT env var
         default_output_dir="./ehbs_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="EHBS_fMRI_metadata.csv",
@@ -246,7 +246,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'adni': DatasetConfig(
         name='adni',
-        default_root_dir="data/qneuromark/Data/ADNI/Updated/fMRI/ADNI/",
+        default_root_dir="",  # Set via --root_dir or ADNI_ROOT env var
         default_output_dir="./adni_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="ADNI_fMRI_metadata.csv",
@@ -261,7 +261,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'oasis3': DatasetConfig(
         name='oasis3',
-        default_root_dir="/data/qneuromark/Data/OASIS/OASIS3/Data_BIDS/Raw_Data",
+        default_root_dir="",  # Set via --root_dir or OASIS3_ROOT env var
         default_output_dir="./oasis3_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="OASIS3_fMRI_metadata.csv",
@@ -276,7 +276,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'abcd': DatasetConfig(
         name='abcd',
-        default_root_dir='/data/neuromark2/Data/ABCD/Data_BIDS_5/Raw_Data/',
+        default_root_dir="",  # Set via --root_dir or ABCD_ROOT env var
         default_output_dir="./abcd_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="ABCD_fMRI_metadata.csv",
@@ -291,7 +291,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'adhd200': DatasetConfig(
         name='adhd200',
-        default_root_dir='/data/qneuromark/Data/ADHD/ADHD200/ZN_Neuromark/ZN_Prep_fMRI/',
+        default_root_dir="",  # Set via --root_dir or ADHD200_ROOT env var
         default_output_dir="./adhd200_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="ADHD200_fMRI_metadata.csv",
@@ -306,7 +306,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'abide2': DatasetConfig(
         name='abide2',
-        default_root_dir='/data/qneuromark/Data/Autism/ABIDE2/ZN_Neuromark/ZN_Prep_fMRI/',
+        default_root_dir="",  # Set via --root_dir or ABIDE2_ROOT env var
         default_output_dir="./abide2_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="ABIDE2_fMRI_metadata.csv",
@@ -321,7 +321,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     'blsa': DatasetConfig(
         name='blsa',
-        default_root_dir='/data/qneuromark/Data/BLSA/fmri/data',
+        default_root_dir="",  # Set via --root_dir or BLSA_ROOT env var
         default_output_dir="./blsa_preprocessing_output",
         default_hdf5_name="data_resampled.h5",
         metadata_filename="BLSA_fMRI_metadata.csv",

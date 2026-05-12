@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import pandas as pd
 import h5py
@@ -12,8 +13,23 @@ except ImportError:  # pragma: no cover - optional dependency
     OpenAI = None
 
 
-def get_targets(data_path):
-    csv_path = '/data/qneuromark/Data/UKBiobank/Data_info/Basket/B4033904/ukb674036.csv'
+def get_targets(data_path, csv_path: str = None):
+    """Extract subject targets from the UKB HDF5 file.
+
+    Args:
+        data_path: Path to the UKB HDF5 data file.
+        csv_path:  Path to the UKB phenotypic CSV file (basket export).
+                   Pass via --csv_path on the command line or the environment
+                   variable UKB_CSV_PATH to avoid embedding institution-specific
+                   paths in source code.
+    """
+    if csv_path is None:
+        csv_path = os.environ.get("UKB_CSV_PATH")
+    if not csv_path:
+        raise ValueError(
+            "UKB phenotypic CSV path is required. "
+            "Provide it via the --csv_path argument or the UKB_CSV_PATH environment variable."
+        )
     
     columns = {
         'age': ('21003-2.0', '21003-2.0'),
@@ -227,7 +243,14 @@ class fMRITextGenerator:
 
 
 if __name__ == '__main__':
-    # df = get_targets('data/UKB/fmri/TianS3/data_resampled.h5')
+    parser = argparse.ArgumentParser(description='Generate UKB instruction data')
+    parser.add_argument('--csv_path', type=str, default=None,
+                        help='Path to UKB phenotypic CSV file (can also be set via UKB_CSV_PATH env var)')
+    parser.add_argument('--data_path', type=str, default='data/UKB/fmri/TianS3/data_resampled.h5',
+                        help='Path to UKB HDF5 data file')
+    args = parser.parse_args()
+
+    # df = get_targets(args.data_path, csv_path=args.csv_path)
     # df.to_csv('data/UKB/fmri/metadata.csv', index=False)
     df = pd.read_csv('data/UKB/fmri/metadata.csv')
 

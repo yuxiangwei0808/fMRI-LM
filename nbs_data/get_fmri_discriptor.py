@@ -553,7 +553,24 @@ def ica_tc_helper(tc, tr=2):
         "outlier_freq": outlier_freq
     }
 
-def get_ica_descriptor_0(root_path):
+def get_ica_descriptor_0(root_path, ica_root: str = None):
+    """Compute ICA-based descriptors for UKB or ABCD subjects.
+
+    Args:
+        root_path: Path to the HDF5 reference file.
+        ica_root:  Root directory that contains per-dataset ICA result folders.
+                   For UKB the expected layout is  <ica_root>/UKB/<subj>/<sess>/...
+                   For ABCD the expected layout is <ica_root>/ABCD/R5/<ica_id>/...
+                   Can also be set via ICA_ROOT env var.
+    """
+    if ica_root is None:
+        ica_root = os.environ.get("ICA_ROOT")
+    if not ica_root:
+        raise ValueError(
+            "ICA root path is required. "
+            "Provide it via the ica_root argument or the ICA_ROOT environment variable."
+        )
+
     # data prepare
     ref = h5py.File(root_path, 'r')
 
@@ -572,16 +589,16 @@ def get_ica_descriptor_0(root_path):
         sess = ref['metadata/sessions'][i].decode('utf-8')
         
         if dataset_name == 'UKB':
-            tc = nib.load(f'/data/qneuromark/Results/ICA/UKB/{subj}/{sess}/func/NeuroMark1_sub01_timecourses_ica_s1_.nii').get_fdata()
-            post_results = loadmat(f'/data/qneuromark/Results/ICA/UKB/{subj}/{sess}/func/NeuroMark1_postprocess_results/NeuroMark1_post_process_sub_001.mat')
+            tc = nib.load(os.path.join(ica_root, f'UKB/{subj}/{sess}/func/NeuroMark1_sub01_timecourses_ica_s1_.nii')).get_fdata()
+            post_results = loadmat(os.path.join(ica_root, f'UKB/{subj}/{sess}/func/NeuroMark1_postprocess_results/NeuroMark1_post_process_sub_001.mat'))
         elif dataset_name == 'ABCD':
             if (subj, sess) not in subjd2icaid:
                 print(f"Subject {subj} session {sess} not found in ICA ID mapping. Skipping.")
                 continue
             ica_id = subjd2icaid[(subj, sess)]
             ica_id = f'ICA{ica_id:05d}'
-            tc = nib.load(f'/data/neuromark2/Results/ICA/ABCD/R5/{ica_id}/ABCD_sub01_timecourses_ica_s1_.nii').get_fdata()
-            post_results = loadmat(f'/data/neuromark2/Results/ICA/ABCD/R5/{ica_id}/ABCD_postprocess_results/ABCD_post_process_sub_001.mat')
+            tc = nib.load(os.path.join(ica_root, f'ABCD/R5/{ica_id}/ABCD_sub01_timecourses_ica_s1_.nii')).get_fdata()
+            post_results = loadmat(os.path.join(ica_root, f'ABCD/R5/{ica_id}/ABCD_postprocess_results/ABCD_post_process_sub_001.mat'))
 
         # average within each network
         tc_avg_network = np.zeros((tc.shape[0], len(ica_network_mapping)))
