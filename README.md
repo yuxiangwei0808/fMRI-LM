@@ -69,32 +69,35 @@ pip install deepspeed
 .
 ├── brain_encoder/           # Vision Transformer encoder for fMRI
 │   ├── vision_transformer.py
+│   ├── vit_mae.py          # Masked autoencoder variant
 │   ├── patch_embed.py
 ├── language_models/         # LLM implementations (Adapt from huggingface's implementations with key modifications to the attention mask)
 │   ├── gpt2.py
 │   └── qwen3.py
-├── quantizers/              # Quantization modules
-│   ├── vq.py               # Vector Quantization
-│   ├── fsq.py              # Finite Scalar Quantization
+├── quantizers/              # Tokenizer: encoder/decoder plus VQ, FSQ and BSQ
+│   └── tokenizer.py
 ├── metrics/                 # Evaluation metrics
 ├── configs/                 # Model and dataset configurations
-│   ├── vit_base_p160.yaml
+│   ├── vit_base_p160_newTok.yaml
 │   ├── dataset_config.yaml
 │   └── ...
 ├── scripts/                 # Training and evaluation scripts
-|   ├── launch_train_quantizer.sh        # Stage 1: Toenizer training (without contrastive learning)
+|   ├── launch_train_quantizer.sh        # Stage 1: Tokenizer training (without contrastive learning)
 │   ├── launch_train_quantizer_contr.sh  # Stage 1: Tokenizer training
+│   ├── launch_train_mae.sh              # Stage 1: Masked-autoencoder training
 │   ├── launch_train_pretrain_paired_deepspeed.sh  # Stage 2: LLM tuning
 │   ├── launch_train_instruction.sh      # Stage 3: Instruction tuning
 │   └── eval_zeroshot.sh
 ├── train_quantizer.py          # Stage 1: Tokenizer training (without contrastive learning)
 ├── train_quantizer_contr.py    # Stage 1: Tokenizer training
+├── train_mae.py                # Stage 1: Masked-autoencoder training
 ├── train_pretrain_paired.py    # Stage 2: LLM tuning
 ├── train_instruction.py         # Stage 3: Instruction tuning
 ├── eval_zeroshot.py            # Zero-shot evaluation
 ├── model_fmrilm.py             # Main model architecture
 ├── model_gpt.py                # Multimodal LLM wrapper
 ├── dataset.py                  # Data loading utilities
+├── checkpoint_naming.py        # Shared run/checkpoint directory naming
 └── utils.py                    # Helper functions
 ```
 
@@ -169,6 +172,18 @@ bash scripts/launch_train_quantizer.sh
 **Key arguments:**
 - `--quantizer`: Quantization type (`vq`, `fsq`)
 - `--desc_type`: Text descriptor types for alignment (`fc`, `ica`, `gradient`, `graph`)
+
+### Stage 1 (alternative): Masked-Autoencoder Pre-training
+
+Train the tokenizer encoder with a masked-autoencoding objective instead of quantization:
+
+```bash
+bash scripts/launch_train_mae.sh
+```
+
+**Key arguments:**
+- `--mask_ratio`: fraction of patches masked during training
+- `--model_size`, `--patch_size`: encoder size and patch length
 
 ### Stage 2: Paired Pre-training
 
