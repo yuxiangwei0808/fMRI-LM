@@ -15,18 +15,33 @@ import os
 import sys
 
 # (source filename in --src, filename published in the HF repo)
-RELEASE_FILES = [
-    ("best_avg_classification_ckpt.pt", "fMRI-LM-B-Qwen3-0.6B-instruct.pt"),
-]
-# Per-task checkpoints, published only with --include-per-task.
-PER_TASK_FILES = [
-    ("best_UKB-sex_ckpt.pt",       "fMRI-LM-B-Qwen3-0.6B-best-UKB-sex.pt"),
-    ("best_HCP-sex_ckpt.pt",       "fMRI-LM-B-Qwen3-0.6B-best-HCP-sex.pt"),
-    ("best_HCP_Aging-sex_ckpt.pt", "fMRI-LM-B-Qwen3-0.6B-best-HCP_Aging-sex.pt"),
-    ("best_ADNI-AD_ckpt.pt",       "fMRI-LM-B-Qwen3-0.6B-best-ADNI-AD.pt"),
-    ("best_ABIDE2-ASD_ckpt.pt",    "fMRI-LM-B-Qwen3-0.6B-best-ABIDE2-ASD.pt"),
-    ("best_ADHD200-ADHD_ckpt.pt",  "fMRI-LM-B-Qwen3-0.6B-best-ADHD200-ADHD.pt"),
-]
+# Published release: stage-1 tokenizer and stage-2 pretraining, three variants.
+# Keys are paths under --src (the checkpoint store root); values are paths in the repo.
+RELEASE_FILES = {
+    "vq-contrastive": [
+        ("tokenizer/contrastive/UKB-robust/contr_siglip-desc_fc_ica-pool_mean_mean-tok_vq-vit_base_p160_newTok-Qwen3-0.6B/ckpt-best.pt",
+         "vq-contrastive/stage1-tokenizer.pt"),
+        ("pretrain/UKB-robust/Qwen3-0.6B/fc_ica_f2t1_Nocontr-lora_r1_a2_drop.1_qk_20260616_173356/"
+         "deepspeed_checkpoint_best_f2t/merged_checkpoint.pt",
+         "vq-contrastive/stage2-pretrain-Qwen3-0.6B.pt"),
+    ],
+    "vq-domain": [
+        ("tokenizer/default/UKB-robust/normsweep0615-tok_vq-vit_base_p160_newTok-domain1-Qwen3-0.6B/ckpt-best.pt",
+         "vq-domain/stage1-tokenizer.pt"),
+        ("pretrain/UKB-robust/Qwen3-0.6B/fc_gradient_text0.1_f2t1_lora_r1_a2_drop.1_qk_vqdomain1_descsweep0619_robust_vqdomain1/"
+         "deepspeed_checkpoint_best_f2t/merged_checkpoint.pt",
+         "vq-domain/stage2-pretrain-Qwen3-0.6B.pt"),
+    ],
+    "mae": [
+        ("tokenizer_mae/UKB/mae-vit_base_p160_newTok-mask50-domain1-Qwen3-0.6B/ckpt-best.pt",
+         "mae/stage1-tokenizer.pt"),
+        ("pretrain/UKB-robust/Qwen3-0.6B/fc_ica_f2t1_MAE_domain-lora_r1_a2_drop.1_qk_0610_182333/"
+         "deepspeed_checkpoint_best_f2t/merged_checkpoint.pt",
+         "mae/stage2-pretrain-Qwen3-0.6B.pt"),
+    ],
+}
+# Training state is stripped from stage-1 files before upload.
+DROP_KEYS = {"optimizer", "lr_scheduler"}
 
 
 def main():
@@ -35,11 +50,11 @@ def main():
     ap.add_argument("--repo-id", required=True,
                     help="target model repo, e.g. yuxiangwei0808/fMRI-LM-B-Qwen3-0.6B")
     ap.add_argument("--src", required=True,
-                    help="directory holding the stage-3 checkpoints")
+                    help="checkpoint store root that the paths above are relative to")
     ap.add_argument("--private", action="store_true",
                     help="create the repo private (default: public)")
-    ap.add_argument("--include-per-task", action="store_true",
-                    help="also upload the six per-task best checkpoints (adds ~15.4 GiB)")
+    ap.add_argument("--variant", choices=sorted(RELEASE_FILES) + ["all"], default="all",
+                    help="which variant to publish (default: all)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list what would be uploaded and exit")
     args = ap.parse_args()
@@ -49,9 +64,8 @@ def main():
     if not os.path.isfile(card):
         sys.exit(f"model card not found: {card}")
 
-    names = list(RELEASE_FILES)
-    if args.include_per_task:
-        names += PER_TASK_FILES
+    variants = sorted(RELEASE_FILES) if args.variant == "all" else [args.variant]
+    names = [pair for v in variants for pair in RELEASE_FILES[v]]
 
     files, missing, total = [], [], 0
     for src_name, repo_name in names:
@@ -72,7 +86,7 @@ def main():
     print(f"model card  : {card} -> README.md")
     print(f"checkpoints : {len(files)} files, {total / 2**30:.1f} GiB")
     for _, name, size in files:
-        print(f"  {name:34} {size / 2**30:6.2f} GiB")
+        print(f"  {name:46} {size / 2**30:6.2f} GiB")
 
     if args.dry_run:
         print("\n--dry-run: nothing uploaded")
@@ -85,10 +99,18 @@ def main():
     api.upload_file(path_or_fileobj=card, path_in_repo="README.md",
                     repo_id=args.repo_id, repo_type="model")
     print("uploaded README.md")
-    for path, name, size in files:
-        print(f"uploading {name} ({size / 2**30:.2f} GiB) ...", flush=True)
-        api.upload_file(path_or_fileobj=path, path_in_repo=name,
-                        repo_id=args.repo_id, repo_type="model")
+    import tempfile, torch
+    with tempfile.TemporaryDirectory() as tmp:
+        for path, name, size in files:
+            if "stage1" in name:
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                ck = {k: v for k, v in ck.items() if k not in DROP_KEYS}
+                path = os.path.join(tmp, name.replace("/", "_"))
+                torch.save(ck, path)
+                size = os.path.getsize(path)
+            print(f"uploading {name} ({size / 2**30:.2f} GiB) ...", flush=True)
+            api.upload_file(path_or_fileobj=path, path_in_repo=name,
+                            repo_id=args.repo_id, repo_type="model")
     print(f"\ndone: https://huggingface.co/{args.repo_id}")
 
 
