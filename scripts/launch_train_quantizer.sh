@@ -1,10 +1,16 @@
 #!/bin/bash
-export PATH="/sysapps/ubuntu-applications/miniconda/4.12.0/miniconda3/bin:$PATH"
-export HF_HOME="/data/users1/ywei/data"
-cd ~/playground/BrainFM/public_repos/fMRI-LM
 
-source activate 
-conda activate playground
+# Resolve the repo root from this script's own location so it runs from anywhere.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_DIR"
+
+# Optional: activate a conda env by exporting FMRILM_CONDA_ENV before running.
+if [ -n "$FMRILM_CONDA_ENV" ]; then
+    conda activate "$FMRILM_CONDA_ENV" 2>/dev/null || source activate "$FMRILM_CONDA_ENV"
+fi
+
+# Hugging Face cache; override by exporting HF_HOME before running.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 # export CUDA_VISIBLE_DEVICES=0,1,2,3
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
   export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)  # Get number of available GPUs
@@ -29,7 +35,7 @@ accelerate launch --num_processes=$NUM_GPUS --num_machines=$COUNT_NODE --main_pr
  --wandb_runname=UKB_robust-VQ_Align-ViT_base-p160 \
  --quantizer=vq \
  --cfg_path=configs/vit_base_p160.yaml \
- --ckpt_dir=./checkpoints/tokenizer/UKB_robust/VQ_Align-ViT_base-p160 \
+ --ckpt_dir=./checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160 \
  --domain_loss_weight=1 \
  --lm_name=gpt2 \
  --epochs=100 \

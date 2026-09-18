@@ -1117,7 +1117,7 @@ def get_args():
     parser.add_argument('--add_desc', default=False, action='store_true', help='whether to add subject medical descriptions to the prompt')
 
     parser.add_argument('--pretrained_ckpt', default='')
-    parser.add_argument('--tokenizer_ckpt', default='checkpoints/tokenizer/UKB_robust-contr_sem/VQ-ViT_small-p32-clip_cls_last/ckpt.pt')
+    parser.add_argument('--tokenizer_ckpt', default='checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160/ckpt-best.pt')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
     parser.add_argument('--no_timestamp', default=False, action='store_true', help='disable automatic timestamp suffix for checkpoint directory')
     parser.add_argument('--resume', default=False, action='store_true', help='resume from the latest checkpoint')

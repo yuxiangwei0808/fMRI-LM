@@ -1293,7 +1293,7 @@ def get_args():
     parser.add_argument('--add_src_info', default=False, action='store_true', help='whether to add source dataset info to the prompt')
     parser.add_argument('--add_desc', default=False, action='store_true', help='whether to add subject medical descriptions to the prompt')
 
-    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB_ABCD_robust/VQ_Align-ViT_base-p160-gpt2-Contr_F2T/ckpt.pt')
+    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB-robust/<STAGE2_RUN_DIR>/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
     parser.add_argument('--tokenizer_ckpt', default='')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
     parser.add_argument('--no_timestamp', default=False, action='store_true', help='disable automatic timestamp suffix for checkpoint directory')

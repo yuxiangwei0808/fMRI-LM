@@ -1184,7 +1184,7 @@ def get_args():
     parser = argparse.ArgumentParser('NeuroLM training script', add_help=False)
     parser.add_argument('--dataset_dir', default=['data/UKB/fmri/TianS3/'], type=list_of_strs, help='path to the dataset directory')
     parser.add_argument('--norm', type=str, default='robust', help='normalization method')
-    parser.add_argument('--tokenizer_path', default='checkpoints/tokenizer/UKB_ABCD_robust/VQ_Align-ViT_base-p160-Qwen3-0.6B/ckpt.pt', help='path where tokenizer is')
+    parser.add_argument('--tokenizer_path', default='checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160/ckpt-best.pt', help='path where tokenizer is')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save. If set to "tmp" (default), will auto-generate based on training config')
     parser.add_argument('--ckpt_postfix', default='', help='optional postfix to add to checkpoint directory name')
     parser.add_argument('--resume', default=False, action='store_true', help='resume from the latest checkpoint')
@@ -1213,7 +1213,7 @@ def get_args():
     parser.add_argument('--text2fmri_weight', type=float, help='weight for text -> fMRI NTP objective', default=0)
 
     parser.add_argument('--quantizer', type=str, default='')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_qwen_p160.yaml', help='path to the TiTok config file',)
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160.yaml', help='path to the TiTok config file',)
 
     # LoRA hyperparameters (override YAML defaults when provided)
     parser.add_argument('--no_lora', action='store_true', default=False, help='disable LoRA and fine-tune the entire model')

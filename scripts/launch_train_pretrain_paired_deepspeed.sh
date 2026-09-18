@@ -3,11 +3,17 @@ if [ -f ~/.bashrc ]; then
     source ~/.bashrc
 fi
 
-export PATH="/sysapps/ubuntu-applications/miniconda/4.12.0/miniconda3/bin:$PATH"
-cd ~/playground/BrainFM/public_repos/fMRI-LM
+# Resolve the repo root from this script's own location so it runs from anywhere.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_DIR"
 
-source activate 
-conda activate playground
+# Optional: activate a conda env by exporting FMRILM_CONDA_ENV before running.
+if [ -n "$FMRILM_CONDA_ENV" ]; then
+    conda activate "$FMRILM_CONDA_ENV" 2>/dev/null || source activate "$FMRILM_CONDA_ENV"
+fi
+
+# Hugging Face cache; override by exporting HF_HOME before running.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 # export CUDA_VISIBLE_DEVICES=0
 export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)  # Get number of available GPUs
 
@@ -23,12 +29,11 @@ echo MASTER_PORT=${MASTER_PORT}
 echo WORLD_SIZE=${NUM_GPUS}
 
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME=/data/users1/ywei/data/cache/
 export DS_SKIP_CUDA_CHECK=1
 
 
 accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=bf16 train_pretrain_paired.py \
- --tokenizer_path=checkpoints/tokenizer/UKB_robust/VQ_Align-ViT_base-p160/ckpt-best.pt \
+ --tokenizer_path=checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160/ckpt-best.pt \
  --fmri_batch_size=4 \
  --gradient_accumulation_steps=8 \
  --epochs=30 \

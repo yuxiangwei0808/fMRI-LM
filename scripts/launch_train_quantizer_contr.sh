@@ -1,9 +1,16 @@
 #!/bin/bash
-export PATH="/sysapps/ubuntu-applications/miniconda/4.12.0/miniconda3/bin:$PATH"
-cd ~/playground/BrainFM
 
-source activate 
-conda activate playground
+# Resolve the repo root from this script's own location so it runs from anywhere.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_DIR"
+
+# Optional: activate a conda env by exporting FMRILM_CONDA_ENV before running.
+if [ -n "$FMRILM_CONDA_ENV" ]; then
+    conda activate "$FMRILM_CONDA_ENV" 2>/dev/null || source activate "$FMRILM_CONDA_ENV"
+fi
+
+# Hugging Face cache; override by exporting HF_HOME before running.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
   export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)  # Get number of available GPUs
@@ -34,7 +41,7 @@ accelerate launch --num_processes=$NUM_GPUS --num_machines=$COUNT_NODE --main_pr
  --fmri_pool_method=cls \
  --text_pool_method=last \
  --contr_weight=1.0 \
- --ckpt_dir=./checkpoints/tokenizer/UKB_ABCD_robust-contr/VQ-ViT_small-p160-soft_siglip_cls_last-domainConfuse0.5 \
+ --ckpt_dir=./checkpoints/tokenizer/UKB_ABCD_robust-contr-VQ-ViT_small-p160-soft_siglip_cls_last-domainConfuse0.5 \
  --desc_type=fc,ica \
  --domain_confuse_weight=0.5 \
  --wandb_log \

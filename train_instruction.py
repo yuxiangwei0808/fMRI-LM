@@ -1022,7 +1022,7 @@ def get_args():
     parser.add_argument('--add_fmri_desc', type=list_of_strs, default=[], help='which fMRI feature descriptions to add to the prompt, e.g. --add_fmri_desc=fc,ica')
     parser.add_argument('--fewshot_samples', default=0, type=int, help='number of few-shot samples to include in the prompt')
 
-    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB/fc_ica_text0.1_f2t1_Qwen3-0.6B_0119_141603/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
+    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB-robust/<STAGE2_RUN_DIR>/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
     parser.add_argument('--tokenizer_ckpt', default='')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
     parser.add_argument('--no_timestamp', default=False, action='store_true', help='disable automatic timestamp suffix for checkpoint directory')
@@ -1049,7 +1049,7 @@ def get_args():
 
     parser.add_argument('--quantizer', type=str, default='vq')
     parser.add_argument('--lm_name', type=str, default='Qwen/Qwen3-0.6B', help='name of the language model to use')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_qwen_p160.yaml', help='path to the model config file',)
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160.yaml', help='path to the model config file',)
     parser.add_argument('--lm_use_cls_head', type=bool, default=False, help='direct do prediction from hidden states of LM, update by the model cfg')
 
     parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',

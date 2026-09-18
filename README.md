@@ -229,7 +229,55 @@ bash scripts/eval_zeroshot.sh
 
 ## Model Checkpoints
 
-Pretrained tokenizer (stage 1) and LLM (stage 2) checkpoints are available at `https://drive.google.com/drive/folders/1vGN12_bCg4CY2d7AodLw163TuP1QKlkG?usp=drive_link`
+**Stage 3 (instruction-tuned, released model)** — `fMRI-LM-B (Qwen3-0.6B)`, on Hugging Face:
+<https://huggingface.co/stanjsx/fMRI-LM-B-Qwen3-0.6B>. See `MODEL_CARD.md` for the full card. The
+checkpoint is self-contained (fMRI tokenizer + LM + LoRA), so evaluation needs only that one file.
+
+**Stage 1 (tokenizer) and stage 2 (paired pretraining)** checkpoints:
+`https://drive.google.com/drive/folders/1vGN12_bCg4CY2d7AodLw163TuP1QKlkG?usp=drive_link`
+
+### Layout expected by the scripts
+
+```
+checkpoints/
+├── tokenizer/UKB_robust-VQ-ViT_base-p160/ckpt-best.pt     # stage 1 output / stage 2 input
+├── pretrain/<dataset>-<norm>/<run>_<MMDD_HHMMSS>/         # stage 2 output (auto-named)
+│   └── deepspeed_checkpoint_best_f2t/merged_checkpoint.pt # -> export STAGE2_CKPT=this
+├── instruction/UKB-robust/Qwen3-0.6B/                     # stage 3 output
+└── released/fMRI-LM-B-Qwen3-0.6B/                         # downloaded release, used by eval
+    └── fMRI-LM-B-Qwen3-0.6B-instruct.pt
+```
+
+Stage 2 auto-generates its own timestamped output directory, so `scripts/launch_train_instruction.sh`
+reads the stage-2 checkpoint from `$STAGE2_CKPT`; export it before running that script.
+
+### Released model results
+
+Recorded by the run itself and stored inside the checkpoint, so these describe the single released
+file. Accuracy / ROC-AUC (%). The paper's Table 3 reports validation numbers, so that column is the
+comparable one.
+
+| task | validation | test | paper fMRI-LM-B(G) | paper fMRI-LM-B(Q) |
+|---|---|---|---|---|
+| UKB-sex | 93.33 / 93.21 | 92.90 / 92.76 | 94.89 / 94.90 | 94.45 / 94.67 |
+| HCP-sex | **84.82 / 84.46** | 82.59 / 81.85 | 82.38 / 83.06 | 83.04 / 85.22 |
+| HCP_Aging-sex | 84.38 / 85.71 | 85.71 / 84.78 | — | — |
+| ADNI-AD | 65.00 / 58.12 | 71.02 / 64.39 | 77.92 / 79.91 | 85.27 / 81.02 |
+| ADHD200-ADHD | 71.43 / 68.57 | 77.68 / 73.63 | 75.06 / 77.14 | 78.57 / 79.48 |
+| ABIDE2-ASD | **78.12 / 76.08** | 63.33 / 63.57 | 73.44 / 73.02 | 76.56 / 76.22 |
+
+This run post-dates the camera-ready version. It improves on both published rows for **HCP-sex** and
+**ABIDE2-ASD**, and is **below** the paper on UKB-sex, ADNI-AD and ADHD200 — markedly so on ADNI-AD.
+Single seed (1337); the paper's parenthesised values are standard deviations over seeds. The stage-2
+checkpoint this run started from was not retained, so the scripts reproduce the recipe rather than
+this exact artifact.
+
+To publish or re-publish the release:
+
+```bash
+python scripts/upload_to_hf.py --repo-id stanjsx/fMRI-LM-B-Qwen3-0.6B \
+  --src <stage-3 run directory> --dry-run
+```
 
 ## Supported Datasets
 
