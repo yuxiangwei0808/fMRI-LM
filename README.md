@@ -31,8 +31,6 @@ fMRI Signal (N_rois × N_timepoints)
     ↓
 Vision Transformer Encoder
     ↓
-Vector Quantizer (VQ/FSQ)
-    ↓
 Projection Layer
     ↓
 Large Language Model (GPT-2/Qwen)
@@ -93,6 +91,8 @@ pip install deepspeed
 ├── train_mae.py                # Stage 1: Masked-autoencoder training
 ├── train_pretrain_paired.py    # Stage 2: LLM tuning
 ├── train_instruction.py         # Stage 3: Instruction tuning
+├── train_instruction_mq.py     # Stage 3: Instruction tuning, multiple query targets per scan
+├── train_instruction_open_ended.py  # Stage 3: Instruction tuning, open-ended answers
 ├── eval_zeroshot.py            # Zero-shot evaluation
 ├── model_fmrilm.py             # Main model architecture
 ├── model_gpt.py                # Multimodal LLM wrapper
