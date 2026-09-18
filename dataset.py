@@ -7,6 +7,7 @@ import h5py
 import torch
 import pandas as pd
 import polars as pl
+import time
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 from transformers import AutoTokenizer
 
@@ -23,7 +24,8 @@ DATASET_INFO = {
 }
 
 class fMRIDataSet(Dataset):
-    def __init__(self, file, inds=None, norm='robust', GPT_training=False, patch_size=None, next_time_mask=False, clip_timepoints=160, **kwargs):
+    def __init__(self, file, inds=None, norm='robust', GPT_training=False, patch_size=None, next_time_mask=False, 
+                 clip_timepoints=160, segment_method='clip', oversample=1.0, **kwargs):
         self.h5_file = os.path.join(file, 'data_resampled.h5')
         with h5py.File(self.h5_file, 'r') as file_handle:
             self.keys = list(file_handle['time_series'].keys())
@@ -37,14 +39,89 @@ class fMRIDataSet(Dataset):
         self.norm = norm
         self.patch_size = patch_size
         self.clip_timepoints = clip_timepoints
+        self.segment_method = segment_method
+        self.oversample = oversample
+
+        # Pre-compute segment mapping if random_clip, sequential_clip, or random_sample is enabled
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            self._build_segment_mapping()
 
         norm_params = np.load(file + 'normalization_params.npz')
-        if norm == 'robust':
+        if norm in ['robust']:
             self.median, self.iqr = norm_params['medians'], norm_params['iqrs']
-        elif norm == 'std':
+            # self.median, self.iqr = 14000, 6500
+        elif norm in ['std']:
             self.mean, self.std = norm_params['mean'], norm_params['std']
+        elif norm == 'robust_roi':
+            self.median, self.iqr = norm_params['medians_roi'][:, None], norm_params['iqrs_roi'][:, None]
+        elif norm == 'std_roi':
+            self.mean, self.std = norm_params['mean_roi'][:, None], norm_params['std_roi'][:, None]
+
+    def _build_segment_mapping(self):
+        """
+        Pre-compute the mapping from global index to (sample_index, segment_start/frame_indices).
+        This enables segmentation data augmentation.
+        
+        For each sample in the dataset:
+        - If N_timepoints >= clip_timepoints:
+          Generate n_clips = oversample * N_timepoints / clip_timepoints segments
+          - random_clip: random start positions for consecutive segments
+          - sequential_clip: sequential non-overlapping windows
+          - random_sample: randomly sample frame indices (stored as tuple)
+        - If N_timepoints < clip_timepoints:
+          Keep single sample (will be interpolated during __getitem__)
+        """
+        self.segment_mapping = []  # List of (sample_idx, start_position) or (sample_idx, frame_indices)
+        
+        with h5py.File(self.h5_file, 'r') as file_handle:
+            for sample_idx in self.inds:
+                k = self.keys[sample_idx]
+                N_timepoints = file_handle['time_series'][k].shape[1]
+                
+                # Calculate number of clips for this sample
+                if N_timepoints >= self.clip_timepoints:
+                    n_clips = int(self.oversample * N_timepoints / self.clip_timepoints)
+                    n_clips = max(1, n_clips)  # At least 1 clip
+                    
+                    if self.segment_method == 'sequential_clip':
+                        # Generate sequential non-overlapping start indices
+                        start_indices = [i * self.clip_timepoints for i in range(n_clips)]
+                        for start in start_indices:
+                            self.segment_mapping.append((sample_idx, int(start)))
+                    elif self.segment_method == 'random_clip':
+                        # Generate random start indices for consecutive segments
+                        max_start = N_timepoints - self.clip_timepoints
+                        if n_clips == 1:
+                            # If only one clip, take from the beginning
+                            start_indices = [0]
+                        else:
+                            # Generate sorted random start indices
+                            start_indices = np.sort(np.random.randint(0, max_start + 1, size=n_clips))
+                        for start in start_indices:
+                            self.segment_mapping.append((sample_idx, int(start)))
+                    elif self.segment_method == 'random_sample':
+                        # Generate n_clips sets of randomly sampled frame indices
+                        for _ in range(n_clips):
+                            # Randomly sample clip_timepoints frames from N_timepoints
+                            # Sort to maintain causality
+                            frame_indices = tuple(sorted(np.random.choice(N_timepoints, size=self.clip_timepoints, replace=False)))
+                            self.segment_mapping.append((sample_idx, frame_indices))
+                    else:
+                        raise ValueError(f'Invalid segment_method: {self.segment_method}')
+                else:
+                    # If sequence is too short, we'll interpolate (no multiple clips)
+                    self.segment_mapping.append((sample_idx, 0))
+
+    def rebuild_segment_mapping(self):
+        """
+        Rebuild the segment mapping with new random samples.
+        """
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            self._build_segment_mapping()
 
     def __len__(self):
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            return len(self.segment_mapping)
         return len(self.inds)
 
     def interpolate_time_dimension(self, X, target_timepoints):
@@ -71,26 +148,56 @@ class fMRIDataSet(Dataset):
         return X_interp.squeeze(0)
 
     def __getitem__(self, index):
-        k = self.keys[self.inds[index]]
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            # Map index to (sample_index, start_position) or (sample_index, frame_indices)
+            sample_idx, start_pos_or_indices = self.segment_mapping[index]
+            k = self.keys[sample_idx]
+        else:
+            k = self.keys[self.inds[index]]
+            start_pos_or_indices = None
+            
         with h5py.File(self.h5_file, 'r') as file_handle:
             X = file_handle['time_series'][k][...]
         
         N_rois, N_timepoints = X.shape
         X = torch.FloatTensor(X)
         
-        # Clip or interpolate to match self.clip_timepoints
-        if N_timepoints > self.clip_timepoints:
-            X = X[:, :self.clip_timepoints]
-        elif N_timepoints < self.clip_timepoints:
+        # Handle random segmentation
+        if N_timepoints < self.clip_timepoints:
             X = self.interpolate_time_dimension(X, self.clip_timepoints)
+        else:
+            if self.segment_method == 'random_sample' and start_pos_or_indices is not None:
+                # Extract randomly sampled frames (maintaining temporal order)
+                X = X[:, list(start_pos_or_indices)]
+            elif self.segment_method in ['random_clip', 'sequential_clip'] and start_pos_or_indices is not None:
+                # Extract the specific consecutive segment
+                X = X[:, start_pos_or_indices:start_pos_or_indices + self.clip_timepoints]
+            elif self.segment_method == 'clip':  # Original clipping/interpolation logic, directly clip the first T timepoints
+                X = X[:, :self.clip_timepoints]
+            elif self.segment_method == 'random_clip1':
+                start_pos = random.randint(0, N_timepoints - self.clip_timepoints)
+                X = X[:, start_pos:start_pos + self.clip_timepoints]
+            elif self.segment_method == 'pool':  # pooling-based segmentation, pool every non-overlapping clip_timepoints into one timepoint by mean pooling
+                N_time_segments = N_timepoints // self.clip_timepoints
+                X = X[:, :N_time_segments * self.clip_timepoints]  # trim the extra timepoints that cannot fit into a full segment
+                X = X.view(N_rois, N_time_segments, self.clip_timepoints).mean(dim=2)  # mean pooling
         
         N_rois, N_timepoints = X.shape
 
         if self.norm is not None:
-            if self.norm == 'std':
+            if self.norm in ['std', 'std_roi']:
                 X = (X - self.mean) / self.std
-            elif self.norm == 'robust':
+            elif self.norm in ['robust', 'robust_roi']:
                 X = (X - self.median) / self.iqr
+            elif self.norm == 'roi':  # each roi time-series norm to zero mean and unit variance
+                X = (X - X.mean(dim=1, keepdim=True)) / (X.std(dim=1, keepdim=True) + 1e-6)
+            elif self.norm == 'frame':  # each timepoint norm to zero mean and unit variance across rois
+                X = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
+            elif self.norm == 'roi_frame':  # each roi and each timepoint norm to zero mean and unit variance
+                X = (X - X.mean(dim=1, keepdim=True)) / (X.std(dim=1, keepdim=True) + 1e-6)
+                X = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
+            else:
+                raise NotImplementedError(f'Normalization method {self.norm} not implemented.')
 
         # TODO: implement GPT mask as in NeuroLM
         if self.GPT_training:
@@ -109,6 +216,37 @@ class fMRIDataSet(Dataset):
         
         return X, X
 
+def get_fmri_desc(dataset_name, descriptor_types):
+    descriptor_dir = f'data/{dataset_name}/fmri/descriptors_rewritten'
+    ds_type_dict = {'fc': 'fc_descriptors.csv', 'gradient': 'gradient_descriptors.csv', 'graph': 'graph_descriptors.csv', 'ica': 'ica_descriptors.csv', 'region_self': 'region_self_descriptors.csv', 'dyno': 'dyno_descriptors.csv'}
+    desc_files = [pd.read_csv(os.path.join(descriptor_dir, ds_type_dict[dt])) for dt in descriptor_types]
+    desc_dict = {}
+    for j in range(len(desc_files)):
+        for i in range(len(desc_files[j])):
+            subj, sess = str(desc_files[j].iloc[i]['subject_id']), str(desc_files[j].iloc[i]['session_id'])
+            row = desc_files[j].iloc[i]
+            desc = row['summary']
+            if descriptor_types[j] == 'fc':
+                desc = "## Functional Connectivity:\n" + desc
+            elif descriptor_types[j] == 'gradient':
+                desc = "## Functional Gradient:\n" + desc
+            elif descriptor_types[j] == 'graph':
+                desc = "## Graph Metrics:\n" + desc
+            elif descriptor_types[j] == 'ica':
+                desc = "## Independent Component Analysis:\n" + desc
+            elif descriptor_types[j] == 'region_self':
+                desc = "## ROI Strength:\n" + desc
+            elif descriptor_types[j] == 'dyno':
+                desc = "## Temporal Dynamics:\n" + desc
+            if (subj, sess) not in desc_dict:
+                desc_dict[(subj, sess)] = []
+            desc_dict[(subj, sess)].append(desc)
+    
+    for key in desc_dict:
+        desc_dict[key] = '\n'.join(desc_dict[key])
+    
+    return desc_dict
+
 class fMRITextDataset(fMRIDataSet):
     def __init__(self, file, descriptor_types, lm_name, inds=None, norm='robust', GPT_training=False, patch_size=None, next_time_mask=False, max_len=768, is_val=False, **kwargs):
         super().__init__(file, inds, norm, GPT_training, patch_size, next_time_mask, **kwargs)
@@ -118,10 +256,6 @@ class fMRITextDataset(fMRIDataSet):
         self.add_fmri_delimiter = kwargs.get('add_fmri_delimiter', False)
 
         dataset_name = file.split('/')[1]
-        if dataset_name == 'UKB':
-            prefix = 'The subject is from UK Biobank dataset, where the cohort has 30-70 years old adults.\n'
-        elif dataset_name == 'ABCD':
-            prefix = 'The subject is from ABCD dataset, where the cohort has 9-10 years old children.\n'
 
         self.texts = {}
         if descriptor_types == ['semantic']:
@@ -129,7 +263,7 @@ class fMRITextDataset(fMRIDataSet):
             for i in range(len(desc_file)):
                 subj, sess = str(desc_file.iloc[i]['subject_id']), str(desc_file.iloc[i]['session_id'])
                 desc = desc_file.iloc[i]['text_description']
-                self.texts[(subj, sess)] = prefix + desc
+                self.texts[(subj, sess)] = desc
 
             # filter for inds without text
             valid_inds = []
@@ -138,28 +272,9 @@ class fMRITextDataset(fMRIDataSet):
                     valid_inds.append(idx)
             self.inds = valid_inds
         else:
-            descriptor_dir = f'data/{dataset_name}/fmri/descriptors_rewritten'
-            ds_type_dict = {'fc': 'fc_descriptors.csv', 'gradient': 'gradient_descriptors.csv', 'graph': 'graph_descriptors.csv', 'ica': 'ica_descriptors.csv'}
-            desc_files = [pd.read_csv(os.path.join(descriptor_dir, ds_type_dict[dt])) for dt in descriptor_types]
-            for i in range(len(desc_files[0])):
-                subj, sess = str(desc_files[0].iloc[i]['subject_id']), str(desc_files[0].iloc[i]['session_id'])
+            self.texts = get_fmri_desc(dataset_name, descriptor_types)
 
-                desc_list = []
-                for j in range(len(desc_files)):
-                    row = desc_files[j].iloc[i]
-                    desc = row['summary']
-                    if descriptor_types[j] == 'fc':
-                        desc = "## Functional Connectivity:\n" + desc
-                    elif descriptor_types[j] == 'gradient':
-                        desc = "## Functional Gradient:\n" + desc
-                    elif descriptor_types[j] == 'graph':
-                        desc = "## Graph Metrics:\n" + desc
-                    elif descriptor_types[j] == 'ica':
-                        desc = "## Independent Component Analysis:\n" + desc
-                    desc_list.append(desc)
-                desc_all = '\n'.join(desc_list)
-                self.texts[(subj, sess)] = prefix + desc_all
-
+            # filter for inds without text description
             valid_inds = np.load(f'data/{dataset_name}/fmri/inds_with_desc.npy').tolist()
             self.inds = [i for i in self.inds if i in valid_inds]
 
@@ -189,7 +304,13 @@ class fMRITextDataset(fMRIDataSet):
     def __getitem__(self, index):
         X, fmri_attn_mask = super().__getitem__(index)
 
-        k = self.keys[self.inds[index]]
+        # Get the correct sample index considering segment_method
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            sample_idx, _ = self.segment_mapping[index]
+            k = self.keys[sample_idx]
+        else:
+            k = self.keys[self.inds[index]]
+        
         idx = int(k[7:])  # remove prefix `sample_`
         with h5py.File(self.h5_file, 'r') as file:
             meta = file['metadata']
@@ -208,12 +329,16 @@ class fMRITextDataset(fMRIDataSet):
         # Add an EOS token to the end of sequence
         if self.eos_token != self.fill_value:  # QWEN3 tokenizer
             pad_pos = (text_input_ids == self.fill_value).nonzero(as_tuple=True)[0]
-            assert len(pad_pos) > 0, f'No pad token found in text: {text}'
-            text_input_ids[pad_pos[0]] = self.eos_token  # replace the first pad token with eos token
-            text_attention_mask[pad_pos[0]] = 1  # unmask the first pad token
+            if len(pad_pos) == 0:  # text sequence length exceed the max_len, replace the last token as eos token
+                text_input_ids[-1] = self.eos_token
+                text_attention_mask[-1] = 1
+            else:
+                text_input_ids[pad_pos[0]] = self.eos_token  # replace the first pad token with eos token
+                text_attention_mask[pad_pos[0]] = 1  # unmask the first pad token
         else:
             # unmask the first EOS token (since pad token may also be eos token id)
             eos_pos = (text_input_ids == self.eos_token).nonzero(as_tuple=True)[0]
+            # assert len(eos_pos) > 0, f'No eos token found in text: {text}, length: {len(text_input_ids)}'
             if len(eos_pos) > 0:
                 eos_pos = eos_pos[1:] if eos_pos[0] == 0 else eos_pos  # if eos is the first token (bos), ignore it (becuase we already added it in the attention mask)
                 text_attention_mask[eos_pos[0]] = 1
@@ -223,8 +348,22 @@ class fMRITextDataset(fMRIDataSet):
 
 class InstrDataset(fMRIDataSet):
     def __init__(self, dataset_name, lm_name='gpt2', is_instruct=True, is_val=False, target_name=None, text_min_len=240,
-                 add_source_info=False, add_desc=False, **kwargs):
+                 add_source_info=False, add_desc=False, add_fmri_desc=[], **kwargs):
         file = f'data/{dataset_name}/fmri/TianS3/'
+        
+        # Pre-filter valid indices before calling parent __init__
+        # This ensures segment_mapping is built with correct indices
+        if os.path.exists(f'data/{dataset_name}/fmri/inds_with_label_{target_name}.npy'):
+            valid_inds = np.load(f'data/{dataset_name}/fmri/inds_with_label_{target_name}.npy').tolist() 
+        else:
+            valid_inds = np.load(f'data/{dataset_name}/fmri/inds_with_label.npy').tolist()
+        
+        # Filter the inds parameter if provided, otherwise use valid_inds directly
+        if 'inds' in kwargs and kwargs['inds'] is not None:
+            kwargs['inds'] = [i for i in kwargs['inds'] if i in valid_inds]
+        else:
+            kwargs['inds'] = valid_inds
+        
         super().__init__(file, **kwargs)
 
         df = pl.read_csv(f'data/{dataset_name}/fmri/metadata_with_text_medical_gpt.csv')
@@ -232,22 +371,22 @@ class InstrDataset(fMRIDataSet):
         for row in df.iter_rows(named=True):  # pre-load into a dict
             self.subject_mapping[(str(row['subject_id']), str(row['session_id']))] = {'Y': row[target_name], 'desc': row['text_description_refined']}
 
-        # some subjects may not have label, filter them out
-        if os.path.exists(f'data/{dataset_name}/fmri/inds_with_label_{target_name}.npy'):
-            valid_inds = np.load(f'data/{dataset_name}/fmri/inds_with_label_{target_name}.npy').tolist() 
-        else:
-            valid_inds = np.load(f'data/{dataset_name}/fmri/inds_with_label.npy').tolist()
-        self.inds = [i for i in self.inds if i in valid_inds]
-
         self.is_instruct = is_instruct
         self.lm_name = lm_name
         self.is_val = is_val
         self.text_min_len = text_min_len
         self.target_name = target_name
         self.add_source_info = add_source_info  # add the dataset source info to the prompt
-        # add the text description (such as physical, cognitive, biomarker, etc) to the prompt.
+
+        self.add_fmri_desc = (add_fmri_desc != [])  # add the fMRI data description (e.g. fc-based, ica-based, etc) to the prompt
+        if add_fmri_desc:
+            fmri_desc_dict = get_fmri_desc(dataset_name, add_fmri_desc)
+            for k in self.subject_mapping:
+                self.subject_mapping[k]['desc_fmri'] = fmri_desc_dict.get(k, '')
+        
+        # add some text description (such as physical, cognitive, biomarker, etc) to the prompt.
         # should only be used for disease classification or biomarker positivity classification
-        if target_name in ['AD', 'AsymAD', 'ADHD', 'ASD']:
+        if target_name not in ['age', 'age_group', 'sex']:
             self.add_desc = add_desc
         else:
             self.add_desc = False
@@ -310,7 +449,7 @@ class InstrDataset(fMRIDataSet):
                 self.text = {'Q': '{src_info}{desc}### Question: {prompt}\n### Answer:', 'A': None}
             self.prompt = '{src_info}{desc}### Question: {prompt}\n### Answer:'
 
-    def get_text(self, target, desc, **kwargs):
+    def get_text(self, target, desc, desc_fmri='', **kwargs):
         if self.target_name in ['age', 'fluidintel', 'fluidcomp', 'flanker']:
             qa_pair = self.text
         else:
@@ -318,7 +457,7 @@ class InstrDataset(fMRIDataSet):
         
         # use random questions if self.questions has multiple entries
         question = random.choice(self.questions)
-        question = self.tokenize_prompt(qa_pair['Q'], question, desc)
+        question = self.tokenize_prompt(qa_pair['Q'], question, desc, desc_fmri)
 
         if self.target_name in ['age', 'fluidintel', 'fluidcomp', 'flanker']:
             answer = torch.IntTensor(self.tokenizer.encode(str(target)))
@@ -326,14 +465,22 @@ class InstrDataset(fMRIDataSet):
             answer = torch.IntTensor(qa_pair['A'])
         return torch.cat((question, answer)), question.size(0)
     
-    def tokenize_prompt(self, template, prompt, desc):
+    def tokenize_prompt(self, template, prompt, desc, desc_fmri=''):
         template = template.replace('{prompt}', prompt)
         if self.add_source_info:
             template = template.replace('{src_info}', self.source_info + '\n')
         else:
             template = template.replace('{src_info}', '')
-        if self.add_desc and desc is not None:
-            template = template.replace('{desc}', '### Description: ' + desc + '\n')
+        if (self.add_desc and desc) or (self.add_fmri_desc and desc_fmri):
+            text = ''
+            if self.add_desc and desc:
+                text = '### Description: ' + desc + '\n'
+            if self.add_fmri_desc and desc_fmri:
+                if text:
+                    text += '### fMRI Data Description: ' + desc_fmri + '\n'
+                else:
+                    text = '### fMRI Data Description: ' + desc_fmri + '\n'
+            template = template.replace('{desc}', text)
         else:
             template = template.replace('{desc}', '')
         # tokens = [self.bos_token] + self.tokenizer.encode(template)
@@ -347,24 +494,63 @@ class InstrDataset(fMRIDataSet):
         return torch.IntTensor(tokens)
     
     def __getitem__(self, index):
-        k = self.keys[self.inds[index]]
-        with h5py.File(self.h5_file, 'r') as file:
-            X = file['time_series'][k][...]
+        # Get the correct sample index considering segment_method
+        if self.segment_method in ['random_clip', 'sequential_clip', 'random_sample']:
+            sample_idx, start_pos_or_indices = self.segment_mapping[index]
+            k = self.keys[sample_idx]
+        else:
+            sample_idx = self.inds[index]
+            k = self.keys[sample_idx]
+            start_pos_or_indices = None
+            
+        for _ in range(10):
+            try:
+                with h5py.File(self.h5_file, 'r') as file:
+                    X = file['time_series'][k][...]
+                break
+            except FileNotFoundError as e:
+                if _ == 9:
+                    raise eq
+                time.sleep(1)
         
         N_rois, N_timepoints = X.shape[:2]
         X = torch.FloatTensor(X)
         
-        if N_timepoints > self.clip_timepoints:
-            X = X[:, :self.clip_timepoints]
-        elif N_timepoints < self.clip_timepoints:
+        # Handle different segment methods
+        if N_timepoints < self.clip_timepoints:
             X = self.interpolate_time_dimension(X, self.clip_timepoints)
+        else:
+            if self.segment_method == 'random_sample' and start_pos_or_indices is not None:
+                # Extract randomly sampled frames (maintaining temporal order)
+                X = X[:, list(start_pos_or_indices)]
+            elif self.segment_method in ['random_clip', 'sequential_clip'] and start_pos_or_indices is not None:
+                # Extract the specific consecutive segment
+                X = X[:, start_pos_or_indices:start_pos_or_indices + self.clip_timepoints]
+            elif self.segment_method == 'clip':
+                X = X[:, :self.clip_timepoints]
+            elif self.segment_method == 'random_clip1':
+                start_pos = random.randint(0, N_timepoints - self.clip_timepoints)
+                X = X[:, start_pos:start_pos + self.clip_timepoints]
+            elif self.segment_method == 'pool':
+                # Pooling-based segmentation: pool every non-overlapping clip_timepoints into one timepoint by mean pooling
+                N_time_segments = N_timepoints // self.clip_timepoints
+                X = X[:, :N_time_segments * self.clip_timepoints]  # trim extra timepoints
+                X = X.view(N_rois, N_time_segments, self.clip_timepoints).mean(dim=1)  # mean pooling
 
         if self.norm is not None:
-            if self.norm == 'std':
+            if self.norm in ['std', 'std_roi']:
                 X = (X - self.mean) / self.std
-            elif self.norm == 'robust':
+            elif self.norm in ['robust', 'robust_roi']:
                 X = (X - self.median) / self.iqr
-        if X.ndim == 3: X = X.permute(2, 0, 1)  # C V T
+            elif self.norm == 'roi':  # each roi time-series norm to zero mean and unit variance
+                X = (X - X.mean(dim=1, keepdim=True)) / (X.std(dim=1, keepdim=True) + 1e-6)
+            elif self.norm == 'frame':  # each timepoint norm to zero mean and unit variance across rois
+                X = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
+            elif self.norm == 'roi_frame':  # each roi and each timepoint norm to zero mean and unit variance
+                X = (X - X.mean(dim=1, keepdim=True)) / (X.std(dim=1, keepdim=True) + 1e-6)
+                X = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
+            else:
+                raise NotImplementedError(f'Normalization method {self.norm} not implemented.')
 
         N_time_segments = self.clip_timepoints // self.patch_size
         num_fmri_tokens = N_time_segments * N_rois
@@ -389,34 +575,30 @@ class InstrDataset(fMRIDataSet):
             sess_id = file['metadata']['sessions'][idx].decode('utf-8')
         Y = self.subject_mapping[(subj_id, sess_id)]['Y']
         desc = self.subject_mapping[(subj_id, sess_id)]['desc']
+        desc_fmri = self.subject_mapping[(subj_id, sess_id)].get('desc_fmri', '') if self.add_fmri_desc else ''
 
         if self.is_val:
             # question = random.choice(self.questions)
             question = self.questions[0]
 
-            text = self.tokenize_prompt(self.prompt, question, desc)
+            text = self.tokenize_prompt(self.prompt, question, desc, desc_fmri)
             valid_text_len = text.size(0)
 
-            # text_gpt_mask is as usual even if padding is applied
-            text_gpt_mask = torch.tril(torch.ones(valid_text_len, valid_text_len))
             pad_len = 0
-
             if self.add_desc and self.text_min_len > valid_text_len:  # manually padding (padding will be removed later; for batch processing purpose only)
                 pad_len = self.text_min_len - valid_text_len
                 text = torch.cat([text, torch.full((pad_len,), self.fill_value, dtype=torch.long)], dim=0)
 
-                # enlarge gpt_mask since padding will be applied to the left of fMRI tokens
-                # gpt_mask = torch.block_diag(torch.zeros(pad_len, pad_len), gpt_mask)
-                text_gpt_mask = torch.block_diag(text_gpt_mask, torch.zeros(pad_len, pad_len))
+            # Return separate masks: fmri_mask (2D) and text_attn_mask (1D padding mask)
+            # The model's _prepare_inputs will combine them with proper interleaving
+            text_attn_mask = torch.zeros(text.size(0), dtype=torch.bool)
+            text_attn_mask[:valid_text_len] = True
 
-            gpt_mask = torch.block_diag(gpt_mask, text_gpt_mask)
-            gpt_mask[pad_len + num_fmri_tokens:pad_len + num_fmri_tokens + valid_text_len, pad_len:pad_len + num_fmri_tokens] = 1  # text can attend to all fMRI tokens
-
-            return X, text, Y, gpt_mask.bool()
+            return X, text, Y, gpt_mask.bool(), text_attn_mask
         else:
             # if any(y is None for y in Y):
             #     raise ValueError(f'Label {self.target_name} is missing for subject {subj_id}, session {sess_id}.')
-            text, prompt_len = self.get_text(Y, desc, subject_id=subj_id, session_id=sess_id)
+            text, prompt_len = self.get_text(Y, desc, desc_fmri=desc_fmri)
             # pad to text_min_len
             valid_text_len = text.size(0)
             
@@ -427,10 +609,8 @@ class InstrDataset(fMRIDataSet):
                 pad_len = self.text_min_len - valid_text_len
                 text = torch.cat([text, torch.full((pad_len,), self.fill_value, dtype=torch.long)], dim=0)  # fill_value=50256 for GPT2
 
-        text_gpt_mask = torch.zeros(text.size(0), text.size(0))
-        text_gpt_mask[:valid_text_len, :valid_text_len] = torch.tril(torch.ones(valid_text_len, valid_text_len))
-        gpt_mask = torch.block_diag(gpt_mask, text_gpt_mask)
-        gpt_mask[num_fmri_tokens:num_fmri_tokens + valid_text_len, :num_fmri_tokens] = 1  # text can attend to all fMRI tokens
+        text_attn_mask = torch.zeros(text.size(0), dtype=torch.bool)
+        text_attn_mask[:valid_text_len] = True
         
         Y_text = torch.full_like(text, fill_value=-1)
         # only preserve the answer part
@@ -438,7 +618,7 @@ class InstrDataset(fMRIDataSet):
         # add a eos to the last token
         Y_text[valid_text_len - 1] = self.eos_token
 
-        return X, text, Y_text, gpt_mask.bool(), Y
+        return X, text, Y_text, gpt_mask.bool(), text_attn_mask, Y
 
     @property
     def dataset_type(self):
@@ -519,15 +699,15 @@ class MultiQuestionInstrDataset(InstrDataset):
         
         # Convert Y from tuple to tensor for multi-task case
         if self.is_val:
-            X, text, Y, gpt_mask = result
+            X, text, Y, gpt_mask, text_attn_mask = result
             # Use long for classification (discrete labels), float for regression
             Y = torch.tensor(Y, dtype=torch.long) if isinstance(Y, tuple) else Y
-            return X, text, Y, gpt_mask
+            return X, text, Y, gpt_mask, text_attn_mask
         else:
-            X, text, Y_text, gpt_mask, Y = result
+            X, text, Y_text, gpt_mask, text_attn_mask, Y = result
             # Use long for classification (discrete labels), float for regression
             Y = torch.tensor(Y, dtype=torch.long) if isinstance(Y, tuple) else Y
-            return X, text, Y_text, gpt_mask, Y
+            return X, text, Y_text, gpt_mask, text_attn_mask, Y
 
 
 class OpenEndedInstrDataset(InstrDataset):
@@ -608,14 +788,14 @@ class OpenEndedInstrDataset(InstrDataset):
         result = super().__getitem__(index)
 
         if self.is_val:
-            X, text, Y, gpt_mask = result
+            X, text, Y, gpt_mask, text_attn_mask = result
             # Y is already a dict for validation - keep it as is
-            return X, text, Y, gpt_mask
+            return X, text, Y, gpt_mask, text_attn_mask
         else:
-            X, text, Y_text, gpt_mask, Y = result
+            X, text, Y_text, gpt_mask, text_attn_mask, Y = result
             # For training, Y is a dict - make it to 0 (not used during training anyway)
             # The actual training target is Y_text (tokenized answer)
-            return X, text, Y_text, gpt_mask, 0
+            return X, text, Y_text, gpt_mask, text_attn_mask, 0
     
 
 def get_fmri_data(file, data_cls=fMRIDataSet, train_ratio=1, val_ratio=0.2, **kwargs):
@@ -687,7 +867,8 @@ def get_data_info(target):
     else:
         raise ValueError(f'Target {target} not supported')
 
-def get_fmri_data_inst(batch_size, val_batch_size, datasets=['UKB'], train_val_test_ratio=[0.7, 0.1, 0.2], dataset_target_mapping=None, dataset_config_dict=None, separate_multi_task_loaders=False, fewshot_samples=0, **kwargs):
+def get_fmri_data_inst(batch_size, val_batch_size, datasets=['UKB'], train_val_test_ratio=[0.7, 0.1, 0.2],
+                       dataset_target_mapping=None, dataset_config_dict=None, separate_multi_task_loaders=False, fewshot_samples=0, **kwargs):
     """
     Get fMRI instruction datasets and dataloaders.
     

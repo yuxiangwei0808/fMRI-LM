@@ -36,7 +36,7 @@ accelerate launch --num_processes=$NUM_GPUS --num_machines=$COUNT_NODE --main_pr
  --dataset_dir=data/UKB/fmri/TianS3/,data/ABCD/fmri/TianS3/ \
  --wandb_runname=UKB_ABCD_robust-contr-soft_siglip_cls_last-vq-vit_small-p160-domainConfuse0.5 \
  --quantizer=vq \
- --cfg_path=configs/vit_small_gpt2_p160.yaml \
+ --cfg_path=configs/vit_base_p160_newTok.yaml \
  --contr_loss=soft_siglip \
  --fmri_pool_method=cls \
  --text_pool_method=last \

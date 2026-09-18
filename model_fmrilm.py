@@ -1,3 +1,7 @@
+"""
+Copied and Adapted from https://github.com/935963004/NeuroLM
+"""
+
 import inspect
 import torch
 import torch.nn as nn

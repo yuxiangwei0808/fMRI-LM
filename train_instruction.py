@@ -10,7 +10,6 @@ from omegaconf import OmegaConf
 import copy
 import colorlog
 import json
-from collections import OrderedDict
 from datetime import datetime
 import shutil
 
@@ -22,10 +21,12 @@ from accelerate.utils import set_seed
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 from model_fmrilm import fMRILM
-from quantizers import *
+from quantizers import Tokenizer
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data_inst
 from utils import get_metrics, get_allowed_token_id
+import checkpoint_naming as ckpt_naming
+from instruction_metrics import summarize_best_dataset_scores
 
 
 def setup_logging(log_level=logging.INFO, log_file=None):
@@ -103,6 +104,15 @@ def create_timestamped_dir(base_dir, add_timestamp=True):
     return timestamped_dir
 
 
+def derive_instruction_ckpt_base(pretrained_ckpt):
+    """Derive instruction checkpoint base dir from a pretraining checkpoint path."""
+    return ckpt_naming.derive_instruction_ckpt_base(pretrained_ckpt)
+
+
+def resolve_ckpt_dir(args):
+    return ckpt_naming.resolve_instruction_ckpt_dir(args)
+
+
 def save_configurations(ckpt_dir, args, cfg_path, logger):
     """Save all configurations to the checkpoint directory"""
     config_dir = os.path.join(ckpt_dir, 'configs')
@@ -158,7 +168,7 @@ def save_configurations(ckpt_dir, args, cfg_path, logger):
         f.write(f"\n" + "=" * 80 + "\n")
         f.write(f"Key Arguments:\n")
         f.write(f"  Datasets: {args.datasets}\n")
-        f.write(f"  Quantizer: {args.quantizer}\n")
+        f.write(f"  Tokenizer Config: {cfg_path}\n")
         f.write(f"  Batch Size (fMRI): {args.fmri_batch_size}\n")
         f.write(f"  Batch Size (Text): {args.text_batch_size}\n")
         f.write(f"  Epochs: {args.epochs}\n")
@@ -173,17 +183,190 @@ def save_configurations(ckpt_dir, args, cfg_path, logger):
     return config_dir
 
 
+
+def prepare_tokenizer_config(cfg):
+    if OmegaConf.select(cfg, "model.vq_model") is not None:
+        raise ValueError(
+            "Legacy model.vq_model configs are no longer supported in this stage. "
+            "Use the unified Tokenizer config with model.quantize_mode instead."
+        )
+    if OmegaConf.select(cfg, "model") is None or OmegaConf.select(cfg, "lm") is None:
+        raise ValueError("Tokenizer configs must contain top-level model and lm sections.")
+    for key in ("num_rois", "num_timestamp", "quantize_mode", "vit_enc_patch_size"):
+        if OmegaConf.select(cfg, f"model.{key}") is None:
+            raise ValueError(f"Tokenizer config is missing model.{key}.")
+    if OmegaConf.select(cfg, "model.image_size") is None:
+        cfg.model.image_size = [int(cfg.model.num_rois), int(cfg.model.num_timestamp)]
+    if OmegaConf.select(cfg, "model.gate_attention") is None and OmegaConf.select(cfg, "model.gate_attn") is not None:
+        cfg.model.gate_attention = cfg.model.gate_attn
+    return cfg
+
+
+def strip_compile_prefix(state_dict):
+    state_dict = dict(state_dict)
+    for prefix in ('_orig_mod.', 'module.'):
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix):
+                state_dict[key[len(prefix):]] = state_dict.pop(key)
+    return state_dict
+
+
+def checkpoint_model_state(checkpoint):
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        return checkpoint['model']
+    return checkpoint
+
+
+def strip_prefix_if_present(state_dict, prefix):
+    prefix = prefix.rstrip('.') + '.'
+    stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    return stripped if stripped else None
+
+
+def map_mae_encoder_to_tokenizer_state(state_dict, expected):
+    candidates = [state_dict]
+    for prefix in ('mae', 'encoder', 'backbone'):
+        stripped = strip_prefix_if_present(state_dict, prefix)
+        if stripped is not None:
+            candidates.append(stripped)
+
+    best_mapped = {}
+    for candidate in candidates:
+        mapped = {}
+        for key, value in candidate.items():
+            new_key = None
+            new_value = value
+            if key.startswith('patch_embed.') or key.startswith('blocks.'):
+                new_key = f'encoder.{key}'
+            elif key.startswith('norm.'):
+                new_key = f"encoder.ln_post.{key[len('norm.'):]}"
+            elif key == 'pos_embed':
+                new_key = 'encoder.pos_embed'
+            elif key == 'cls_token':
+                new_key = 'encoder.cls_embed'
+                if value.ndim == 3 and value.shape[1] == 1:
+                    new_value = value.squeeze(1)
+
+            if new_key in expected and expected[new_key].shape == new_value.shape:
+                mapped[new_key] = new_value
+
+        if len(mapped) > len(best_mapped):
+            best_mapped = mapped
+    return best_mapped
+
+
+def load_tokenizer_state(tokenizer, checkpoint, logger):
+    state_dict = strip_compile_prefix(checkpoint_model_state(checkpoint))
+    expected = tokenizer.state_dict()
+    candidates = [('raw', state_dict)]
+    for prefix in (
+        'quantizer',
+        'fmri_model.quantizer',
+        'module.quantizer',
+        'module.fmri_model.quantizer',
+        'tokenizer',
+        'module.tokenizer',
+    ):
+        stripped = strip_prefix_if_present(state_dict, prefix)
+        if stripped is not None:
+            candidates.append((prefix, stripped))
+
+    mae_mapped = map_mae_encoder_to_tokenizer_state(state_dict, expected)
+    if mae_mapped:
+        candidates.append(('mae_encoder', mae_mapped))
+
+    def score(candidate):
+        _, sd = candidate
+        return sum(k in expected and expected[k].shape == v.shape for k, v in sd.items())
+
+    best_name, best = max(candidates, key=score)
+    filtered = {k: v for k, v in best.items() if k in expected and expected[k].shape == v.shape}
+    if not filtered:
+        raise ValueError("No tokenizer checkpoint keys matched the unified Tokenizer state dict.")
+
+    msg = tokenizer.load_state_dict(filtered, strict=False)
+    tokenizer._checkpoint_source = best_name
+    tokenizer._loaded_from_mae_encoder = best_name == 'mae_encoder'
+    logger.info(
+        f"Tokenizer state loaded from {best_name}: matched={len(filtered)}, "
+        f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}"
+    )
+    if best_name == 'mae_encoder':
+        logger.info(
+            "Loaded MAE encoder weights into Tokenizer.encoder; "
+            "Tokenizer decoder and quantizer parameters remain initialized from cfg."
+        )
+    else:
+        core_missing = [k for k in msg.missing_keys if k.startswith(('encoder.', 'quantize.'))]
+        if core_missing:
+            logger.warning(f"Tokenizer core missing keys after load: {core_missing[:10]}")
+    return msg
+
+
+def adapt_mindlm_state_dict_for_tokenizer_adapter(state_dict, model):
+    state_dict = strip_compile_prefix(state_dict)
+    expected = model.state_dict()
+    adapted = dict(state_dict)
+    for key, value in state_dict.items():
+        if key.startswith('tokenizer.') and not key.startswith('tokenizer.encoder.'):
+            new_key = 'tokenizer.encoder.' + key[len('tokenizer.'):]
+            if new_key in expected and expected[new_key].shape == value.shape:
+                adapted[new_key] = value
+    return adapted
+
+
+class TokenizerEncoderForLM(torch.nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+        self.patch_embed = encoder.patch_embed
+        self.num_patches = encoder.num_patches
+        self.embed_dim = encoder.width
+
+    def forward(self, x):
+        encoder_param = next(self.encoder.parameters(), None)
+        if encoder_param is not None:
+            x = x.to(device=encoder_param.device, dtype=encoder_param.dtype)
+        features, _ = self.encoder(x)
+        return features.permute(0, 2, 1)
+
+
 def main(args):
     # Create timestamped checkpoint directory
-    args.ckpt_dir = create_timestamped_dir(args.ckpt_dir, add_timestamp=not args.no_timestamp)
+    args.ckpt_dir = resolve_ckpt_dir(args)
+    if args.wandb_runname == 'tmp':
+        args.wandb_runname = os.path.basename(args.ckpt_dir)
     
     # Setup logging
     os.makedirs(args.ckpt_dir, exist_ok=True)
     log_file = os.path.join(args.ckpt_dir, 'training.log') if args.ckpt_dir and args.save_ckpt else None
     logger = setup_logging(log_file=log_file)
+
+    # extrac normalization from pretrained_ckpt
+    norm = args.pretrained_ckpt.split('/')[2]
+    norm = norm.split('-')[1]
+    if norm != args.norm:
+        logger.warning(f"Normalization method in pretrained checkpoint ({norm}) does not match command-line argument ({args.norm}). Using pretrained checkpoint's normalization method.")
+        args.norm = norm
     
     # Save all configurations
     save_configurations(args.ckpt_dir, args, args.cfg_path, logger)
+    lineage_path = ckpt_naming.write_lineage_json(
+        args.ckpt_dir,
+        stage='instruction',
+        variant='standard',
+        checkpoint_dir=args.ckpt_dir,
+        pretrained_checkpoint=args.pretrained_ckpt,
+        pretrain_run=os.path.basename(ckpt_naming.checkpoint_run_dir(args.pretrained_ckpt)) if args.pretrained_ckpt else None,
+        tokenizer_checkpoint=args.tokenizer_ckpt or None,
+        cfg_path=args.cfg_path,
+        datasets=args.datasets,
+        norm=args.norm,
+        lm_name=args.lm_name,
+        run_name=os.path.basename(args.ckpt_dir),
+        args=vars(args),
+    )
+    logger.info(f"Lineage metadata saved to: {lineage_path}")
     
     # Initialize Accelerator
     try:
@@ -250,15 +433,15 @@ def main(args):
         y = torch.stack([torch.from_numpy((dummy_data[i+1:i+1+num_token]).astype(np.int64)) for i in ix])
         return x, y
 
-    # Load tokenizer
-    model_cfg = OmegaConf.load(args.cfg_path).model
-    quantizer_cfg = model_cfg.vq_model
-    quantizer_cfg.img_size = (quantizer_cfg.num_rois, quantizer_cfg.num_timestamp)
-    lm_cfg = model_cfg.lm
+    # Load tokenizer config
+    cfg = prepare_tokenizer_config(OmegaConf.load(args.cfg_path))
+    quantizer_cfg = cfg.model
+    lm_cfg = cfg.lm
     if lm_cfg.get('base_model') is None:
         OmegaConf.set_struct(lm_cfg, False)  # Allow modification
         lm_cfg.base_model = args.lm_name
         OmegaConf.set_struct(lm_cfg, True)   # Re-enable struct mode
+    patch_size = int(quantizer_cfg.vit_enc_patch_size)
 
     dataset_target_mapping = None
     dataset_config_dict = None
@@ -306,8 +489,8 @@ def main(args):
         args.datasets,
         lm_name=args.lm_name,
         norm=args.norm,
-        patch_size=quantizer_cfg.patch_size,
-        next_time_mask=(args.quantizer != 'titok'),
+        patch_size=patch_size,
+        next_time_mask=True,
         use_random_prompt=args.use_random_prompt,
         add_source_info=args.add_src_info,
         add_desc=args.add_desc,
@@ -318,24 +501,13 @@ def main(args):
     )
     logger.info(f"Data loaders created - Train batches: {len(data_loader_train)}")
 
-    if args.quantizer == 'vq':
-        quantizer_cls = VQ
-    elif args.quantizer == 'fsq':
-        quantizer_cls = FSQ_Model
-
     # Create tokenizer
     try:
-        tokenizer = quantizer_cls(quantizer_cfg, decoder_out_dim=quantizer_cfg.num_timestamp)
-
-        latent_tokens = None
-        if args.quantizer == 'titok':
-            latent_tokens = tokenizer.latent_tokens
-
-        tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
-
-        logger.info("Tokenizer checkpoint memory cleaned up")
+        tokenizer = Tokenizer(cfg)
+        tokenizer_encoder = TokenizerEncoderForLM(copy.deepcopy(tokenizer.encoder))
+        logger.info("Tokenizer created from unified Tokenizer config")
     except Exception as e:
-        logger.error(f"Failed to create and load tokenizer: {e}")
+        logger.error(f"Failed to create tokenizer: {e}")
         raise
 
     # Model initialization
@@ -358,12 +530,21 @@ def main(args):
         init_from = 'scratch'
         logger.info("Training from scratch")
 
-    num_tokens = tokenizer.encoder.num_patches
-    num_chans = quantizer_cfg.num_rois if args.quantizer != 'titok' else 1  # TiTok uses vanilla NTP since it produes latent tokens
+    num_tokens = tokenizer_encoder.num_patches
+    num_chans = int(quantizer_cfg.num_rois)
 
     iter_num = 0
-    n_embd = quantizer_cfg.n_embd
+    n_embd = tokenizer_encoder.embed_dim
     dropout = 0.0
+
+    fmri_vocab_size = tokenizer.codebook_size if hasattr(tokenizer, 'codebook_size') else 0
+    if fmri_vocab_size:
+        if lm_cfg.fmri_vocab_size != fmri_vocab_size:
+            logger.warning(f"Overriding lm.fmri_vocab_size from {lm_cfg.fmri_vocab_size} to tokenizer codebook size {fmri_vocab_size}")
+        lm_cfg.fmri_vocab_size = fmri_vocab_size
+    lm_cfg.num_fmri_tokens = num_tokens
+    lm_cfg.num_rois = num_chans
+
     # Convert to a plain dict so that checkpoint model_args (which may have extra keys
     # like LoRA hyperparameters) can be merged without OmegaConf struct-mode errors.
     model_args = OmegaConf.to_container(lm_cfg, resolve=True)
@@ -372,6 +553,7 @@ def main(args):
     best_avg_metric_regression = -float('inf')
     best_avg_metric_classification = -float('inf')
     best_metrics_per_dataset = {}
+    best_epoch_per_dataset = {}
     all_results = {'validation': {}, 'test': {}}
 
     try:
@@ -403,7 +585,7 @@ def main(args):
             gptconf.peft_tune = False
             gptconf.freeze_pretrained_lora = False
             
-            model = fMRILM(gptconf, tokenizer_encoder, False, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, False, num_rois=num_chans, n_embd=n_embd)
             
             if pretrained_use_peft:
                 # Pretrained model has LoRA - apply LoRA to match checkpoint structure before loading
@@ -414,11 +596,7 @@ def main(args):
             gptconf.peft_tune = temp_peft_flag
             gptconf.freeze_pretrained_lora = temp_freeze_flag
 
-            state_dict = checkpoint['model']
-            unwanted_prefix = '_orig_mod.'
-            for k,v in list(state_dict.items()):
-                if k.startswith(unwanted_prefix):
-                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            state_dict = adapt_mindlm_state_dict_for_tokenizer_adapter(checkpoint['model'], model)
             loading_result = model.load_state_dict(state_dict, strict=False)
             
             if loading_result.unexpected_keys:
@@ -434,35 +612,10 @@ def main(args):
         elif init_from == 'pretrained_tokenizer':
             logger.info(f"Initializing tokenizer from checkpoint")
             checkpoint = torch.load(args.tokenizer_ckpt, map_location='cpu', weights_only=False)
+            load_tokenizer_state(tokenizer, checkpoint, logger)
+            tokenizer_encoder = TokenizerEncoderForLM(copy.deepcopy(tokenizer.encoder))
             gptconf = MultimodalConfig(**model_args)
-
-            # load checkpoint for the tokenizer only
-            tokenizer_state_dict = checkpoint['model']
-            # Clean up state dict
-            unwanted_prefix = '_orig_mod.'
-            for k,v in list(tokenizer_state_dict.items()):
-                if k.startswith(unwanted_prefix):
-                    tokenizer_state_dict[k[len(unwanted_prefix):]] = tokenizer_state_dict.pop(k)
-            
-            try:
-                msg = tokenizer.load_state_dict(tokenizer_state_dict, strict=False)
-                assert msg.missing_keys == []
-                logger.info("Tokenizer loaded successfully from checkpoint")
-            except Exception as e:
-                all_keys = list(tokenizer_state_dict.keys())
-                new_dict = OrderedDict()
-                prefix_dict = {'vq': 'VQ', 'fsq': 'FSQ', 'titok': 'TiTok'}
-                prefix = prefix_dict[args.quantizer]
-                for key in all_keys:
-                    if key.startswith(f'{prefix}.'):
-                        new_dict[key[len(prefix) + 1:]] = tokenizer_state_dict[key]
-                    elif key.startswith('fmri_model.') and not key.startswith('text_model.'):
-                        new_dict[key[len('fmri_model.'):]] = tokenizer_state_dict[key]
-                msg = tokenizer.load_state_dict(new_dict, strict=False)
-                assert msg.missing_keys == []
-            
-            tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
-            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=quantizer_cfg.num_rois, n_embd=n_embd, latent_tokens=latent_tokens)
+            model = fMRILM(gptconf, tokenizer_encoder, args.tune_tokenizer, num_rois=num_chans, n_embd=n_embd)
 
             start_epoch = 0
             logger.info("Model tokenizer initialized from checkpoint")
@@ -577,16 +730,17 @@ def main(args):
             pass
         else:
             for step, batch in tqdm(enumerate(data_loader_train), desc="Training Steps", disable=not accelerator.is_main_process, total=len(data_loader_train)):
-                X_fmri, X_text, Y_text, gpt_mask, Y = batch
+                X_fmri, X_text, Y_text, fmri_mask, text_attn_mask, Y = batch
                 X_fmri = X_fmri.float()
-                gpt_mask = gpt_mask.to(X_fmri.dtype)
+                fmri_mask = fmri_mask.to(X_fmri.dtype)
+                text_attn_mask = text_attn_mask.to(X_fmri.dtype)
                 Y_fmri = torch.full((X_fmri.size(0), num_tokens), fill_value=-1-vocab_size, dtype=torch.long, device=X_fmri.device)  # no loss on fMRI tokens
 
                 if X_fmri.device != accelerator.device:
-                    X_fmri, Y_fmri, X_text, Y_text, gpt_mask = X_fmri.to(accelerator.device), Y_fmri.to(accelerator.device), X_text.to(accelerator.device), Y_text.to(accelerator.device), gpt_mask.to(accelerator.device)
+                    X_fmri, Y_fmri, X_text, Y_text, fmri_mask, text_attn_mask = X_fmri.to(accelerator.device), Y_fmri.to(accelerator.device), X_text.to(accelerator.device), Y_text.to(accelerator.device), fmri_mask.to(accelerator.device), text_attn_mask.to(accelerator.device)
 
                 with accelerator.accumulate(model):
-                    loss1, log1, logits = model(X_fmri, Y_fmri, X_text, Y_text, gpt_mask, Y=Y)
+                    loss1, log1, logits = model(X_fmri, Y_fmri, X_text, Y_text, (fmri_mask, text_attn_mask), Y=Y)
                     # loss2, log2, _ = model(None, None, X_text_random, Y_text_random)
 
                     loss = loss1 + loss2 if log2 is not None else loss1
@@ -804,6 +958,9 @@ def main(args):
                     best_metrics_per_dataset[data_name] = epoch_val_results[data_name]
                     logger.info(f"New best validation MAE for {data_name}: {best_metrics_per_dataset[data_name]['mae']}")
             
+                if is_best_list[data_name]:
+                    best_epoch_per_dataset[data_name] = epoch
+
             # Compute average metrics for regression and classification separately
             if val_metrics_regression:
                 current_avg_metric_regression = np.mean(val_metrics_regression)
@@ -821,6 +978,19 @@ def main(args):
                     best_avg_metric_classification = current_avg_metric_classification
                     logger.info(f"New best average CLASSIFICATION validation metric: {best_avg_metric_classification:.4f}")
             
+            best_dataset_summary = summarize_best_dataset_scores(
+                best_metrics_per_dataset,
+                data_loader_val_test=data_loader_val_test,
+                best_epoch_per_dataset=best_epoch_per_dataset,
+            )
+            avg_best_dataset_metric = best_dataset_summary['avg_best_per_dataset_metric']
+            if avg_best_dataset_metric is not None:
+                logger.info(f"Average of per-dataset best validation scores: {avg_best_dataset_metric:.4f}")
+            if best_dataset_summary['avg_best_per_dataset_metric_regression'] is not None:
+                logger.info(f"Average of per-dataset best REGRESSION scores: {best_dataset_summary['avg_best_per_dataset_metric_regression']:.4f}")
+            if best_dataset_summary['avg_best_per_dataset_metric_classification'] is not None:
+                logger.info(f"Average of per-dataset best CLASSIFICATION scores: {best_dataset_summary['avg_best_per_dataset_metric_classification']:.4f}")
+
             # Add average metrics to wandb logging
             if args.wandb_log and wandb_metrics:
                 if val_metrics_regression:
@@ -829,6 +999,12 @@ def main(args):
                 if val_metrics_classification:
                     wandb_metrics['val/avg_metric_classification'] = current_avg_metric_classification
                     wandb_metrics['val/best_avg_metric_classification'] = best_avg_metric_classification
+                if avg_best_dataset_metric is not None:
+                    wandb_metrics['val/avg_best_per_dataset_metric'] = avg_best_dataset_metric
+                if best_dataset_summary['avg_best_per_dataset_metric_regression'] is not None:
+                    wandb_metrics['val/avg_best_per_dataset_metric_regression'] = best_dataset_summary['avg_best_per_dataset_metric_regression']
+                if best_dataset_summary['avg_best_per_dataset_metric_classification'] is not None:
+                    wandb_metrics['val/avg_best_per_dataset_metric_classification'] = best_dataset_summary['avg_best_per_dataset_metric_classification']
         
         # Log all validation/test metrics together in a single wandb call
         if args.wandb_log and accelerator.is_main_process and wandb_metrics:
@@ -851,7 +1027,9 @@ def main(args):
                 'validation_results': epoch_val_results,
                 'test_results': epoch_test_results,
                 'best_avg_metric_regression': best_avg_metric_regression,
-                'best_avg_metric_classification': best_avg_metric_classification
+                'best_avg_metric_classification': best_avg_metric_classification,
+                'best_epoch_per_dataset': best_epoch_per_dataset,
+                'best_dataset_summary': best_dataset_summary
             }
             
             # Save best model checkpoint
@@ -889,7 +1067,9 @@ def main(args):
                 'validation': epoch_val_results,
                 'test': epoch_test_results,
                 'avg_validation_metric_regression': current_avg_metric_regression if current_avg_metric_regression != -float('inf') else None,
-                'avg_validation_metric_classification': current_avg_metric_classification if current_avg_metric_classification != -float('inf') else None
+                'avg_validation_metric_classification': current_avg_metric_classification if current_avg_metric_classification != -float('inf') else None,
+                'avg_best_per_dataset_metric': avg_best_dataset_metric,
+                'best_dataset_summary': best_dataset_summary
             }
             
             with open(epoch_results_file, 'w') as f:
@@ -907,6 +1087,8 @@ def main(args):
                 'best_avg_metric_regression': best_avg_metric_regression if best_avg_metric_regression != -float('inf') else None,
                 'best_avg_metric_classification': best_avg_metric_classification if best_avg_metric_classification != -float('inf') else None,
                 'best_metrics_per_dataset': best_metrics_per_dataset,
+                'best_epoch_per_dataset': best_epoch_per_dataset,
+                **best_dataset_summary,
                 'best_epoch_regression': epoch if is_best_avg_regression else getattr(main, '_best_epoch_regression', 0),
                 'best_epoch_classification': epoch if is_best_avg_classification else getattr(main, '_best_epoch_classification', 0)
             }
@@ -925,6 +1107,8 @@ def main(args):
     accelerator.end_training()
 
 
+default_preds = {'sex': ' Male', 'ADHD': ' Control', 'ASD': ' Control', 'age': ' 30'}
+
 def get_pred(pred_string, dataset_info):
     # get the next word after `Answer: `
     pred_words = pred_string.split(' ')
@@ -938,7 +1122,7 @@ def get_pred(pred_string, dataset_info):
         pred = pred_words[min(ans_idx + 1, len(pred_words) - 1)]
     except IndexError:
         print('Index out of range!', pred_words)
-        raise Exception("Failed to extract prediction from model output")
+        pred = default_pred
     if not dataset_info['is_regression']:
         pred = dataset_info['label_dic'].get(pred, 0.)
     else:
@@ -952,18 +1136,18 @@ def evaluate(model, dataloader, accelerator, args, logger, vocab_size, data_info
     all_preds, all_targets = [], []    
     
     for batch_idx, batch in enumerate(dataloader):
-        X_fmri, X_text, label, gpt_mask = batch
+        X_fmri, X_text, label, fmri_mask, text_attn_mask = batch
         X_fmri = X_fmri.float()
-        assert args.quantizer != 'titok'
-        gpt_mask = gpt_mask.to(X_fmri.dtype)        
+        fmri_mask = fmri_mask.to(X_fmri.dtype)
+        text_attn_mask = text_attn_mask.to(X_fmri.dtype)
 
         if not args.lm_use_cls_head:
             # Use autocast for inference to match training precision
             with accelerator.autocast():
                 if accelerator.num_processes == 1:
-                    text = model.generate(X_fmri, X_text, gpt_mask, max_new_tokens=4, text_gen=True, allowed_tokens=allowed_tokens)
+                    text = model.generate(X_fmri, X_text, (fmri_mask, text_attn_mask), max_new_tokens=4, text_gen=True, allowed_tokens=allowed_tokens)
                 else:
-                    text = model.module.generate(X_fmri, X_text, gpt_mask, max_new_tokens=4, text_gen=True, allowed_tokens=allowed_tokens, accelerator=accelerator)
+                    text = model.module.generate(X_fmri, X_text, (fmri_mask, text_attn_mask), max_new_tokens=4, text_gen=True, allowed_tokens=allowed_tokens, accelerator=accelerator)
 
             batch_preds = []
             for i, t in enumerate(text):
@@ -974,7 +1158,7 @@ def evaluate(model, dataloader, accelerator, args, logger, vocab_size, data_info
         else:
             # Use autocast for inference to match training precision
             with accelerator.autocast():
-                _, _, logits = model(X_fmri, None, X_text, None, gpt_mask, Y=label)
+                _, _, logits = model(X_fmri, None, X_text, None, (fmri_mask, text_attn_mask), Y=label)
             if data_info['is_regression']:
                 batch_preds = logits[:, 0].cpu().numpy().tolist()
             else:
@@ -1022,9 +1206,10 @@ def get_args():
     parser.add_argument('--add_fmri_desc', type=list_of_strs, default=[], help='which fMRI feature descriptions to add to the prompt, e.g. --add_fmri_desc=fc,ica')
     parser.add_argument('--fewshot_samples', default=0, type=int, help='number of few-shot samples to include in the prompt')
 
-    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB-robust/<STAGE2_RUN_DIR>/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
+    parser.add_argument('--pretrained_ckpt', default='checkpoints/pretrain/UKB-robust/Qwen3-0.6B/fc_ica_f2t1_MAE-lora_r1_a2_drop.1_qk_0610_213027/deepspeed_checkpoint_best_f2t/merged_checkpoint.pt')
     parser.add_argument('--tokenizer_ckpt', default='')
-    parser.add_argument('--ckpt_dir', default='tmp', help='path where to save, empty for no saving')
+    parser.add_argument('--ckpt_dir', default='tmp', help='path where to save; "tmp" derives it from --pretrained_ckpt')
+    parser.add_argument('--ckpt_postfix', default='', type=str, help='optional checkpoint postfix appended before the timestamp')
     parser.add_argument('--no_timestamp', default=False, action='store_true', help='disable automatic timestamp suffix for checkpoint directory')
     parser.add_argument('--log_interval', default=10, type=int)
     parser.add_argument('--wandb_log', default=False, action='store_true')
@@ -1036,7 +1221,7 @@ def get_args():
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
     parser.add_argument('--fmri_batch_size', default=1, type=int)
     parser.add_argument('--global_fmri_batch_size', default=None, type=int, help='global batch size for fMRI across all GPUs')
-    parser.add_argument('--text_batch_size', default=1, type=int)
+    parser.add_argument('--text_batch_size', default=8, type=int)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--save_ckpt', default=False, action=argparse.BooleanOptionalAction, help='whether to save checkpoints')
     parser.add_argument('--save_ckpt_freq', default=10, type=int)
@@ -1047,9 +1232,8 @@ def get_args():
 
     parser.add_argument('--freeze_pretrained_lora', action='store_true', help='whether to freeze the pretrained LoRA adapter and add a new LoRA adapter for instruction tuning', default=False)
 
-    parser.add_argument('--quantizer', type=str, default='vq')
     parser.add_argument('--lm_name', type=str, default='Qwen/Qwen3-0.6B', help='name of the language model to use')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160.yaml', help='path to the model config file',)
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160_newTok.yaml', help='path to the model config file',)
     parser.add_argument('--lm_use_cls_head', type=bool, default=False, help='direct do prediction from hidden states of LM, update by the model cfg')
 
     parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',

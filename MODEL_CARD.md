@@ -10,36 +10,55 @@ tags:
   - qwen3
 ---
 
-# fMRI-LM-B (Qwen3-0.6B)
+# fMRI-LM-B (Qwen3-0.6B) — pretrained backbones
 
-Instruction-tuned checkpoint for **fMRI-LM**, a foundation model that aligns functional MRI with
-language.
+Stage-1 tokenizers and stage-2 paired-pretraining checkpoints for **fMRI-LM**, a foundation model
+that aligns functional MRI with language.
 
 - Code: <https://github.com/yuxiangwei0808/fMRI-LM>
 - Paper: [arXiv:2511.21760](https://arxiv.org/abs/2511.21760)
 
-## File
+## Files
 
-`fMRI-LM-B-Qwen3-0.6B-instruct.pt` (2.56 GiB)
+Three variants, differing in the objective the stage-1 fMRI tokenizer was trained with.
 
-Self-contained: the fMRI tokenizer, positional embedding, encode-transform layer and the
-Qwen3-0.6B LM with its LoRA adapters, plus `model_args` and the metrics the run recorded for
-itself. No separate stage-1 or stage-2 file is needed to evaluate.
+**`vq-contrastive/`** — vector quantization + SigLIP contrastive alignment.
+
+| file | stage | size |
+|---|---|---|
+| `vq-contrastive/stage1-tokenizer.pt` | 1 — fMRI tokenizer | 0.95 GiB |
+| `vq-contrastive/stage2-pretrain-Qwen3-0.6B.pt` | 2 — paired fMRI-text pretraining | 1.28 GiB |
+
+**`vq-domain/`** — vector quantization + adversarial domain loss.
+
+| file | stage | size |
+|---|---|---|
+| `vq-domain/stage1-tokenizer.pt` | 1 — fMRI tokenizer | 0.94 GiB |
+| `vq-domain/stage2-pretrain-Qwen3-0.6B.pt` | 2 — paired fMRI-text pretraining | 1.28 GiB |
+
+**`mae/`** — masked autoencoding (mask ratio 0.5) + adversarial domain loss.
+
+| file | stage | size |
+|---|---|---|
+| `mae/stage1-tokenizer.pt` | 1 — fMRI tokenizer | 0.71 GiB |
+| `mae/stage2-pretrain-Qwen3-0.6B.pt` | 2 — paired fMRI-text pretraining | 1.28 GiB |
+
+All three were trained on UK Biobank with robust normalisation and Qwen3-0.6B. Stage-2 files are
+DeepSpeed checkpoints already merged to a single file.
+
+The MAE stage-1 file loads with `MaskedAutoencoderViT`; the two VQ stage-1 files load with the
+`Tokenizer` class. They are not interchangeable.
 
 ## Usage
 
-```python
-import torch
+Clone the repo, place a stage-1 file where stage 2 expects it, or a stage-2 file where stage 3
+expects it, and run the corresponding script in `scripts/`. Stage 3 reads its parent through
+`$STAGE2_CKPT`:
 
-ckpt = torch.load("fMRI-LM-B-Qwen3-0.6B-instruct.pt", map_location="cpu", weights_only=False)
-print(ckpt["model_args"])          # architecture config used at training time
-print(ckpt["validation_results"])  # metrics recorded by the run
-state_dict = ckpt["model"]         # keys: llm.*, tokenizer.*, pos_embed, encode_transform_layer.*
+```bash
+export STAGE2_CKPT=/path/to/vq-contrastive/stage2-pretrain-Qwen3-0.6B.pt
+bash scripts/launch_train_instruction.sh
 ```
-
-To evaluate with the repo, place the file at
-`checkpoints/released/fMRI-LM-B-Qwen3-0.6B/fMRI-LM-B-Qwen3-0.6B-instruct.pt` and run
-`bash scripts/eval_zeroshot.sh`.
 
 Inputs must be preprocessed as the repo README describes: TR resampled to 2.0 s, 160 timepoints,
 450 ROIs (Schaefer-400 + Tian-S3), then robust z-scored per ROI with site-wise variance

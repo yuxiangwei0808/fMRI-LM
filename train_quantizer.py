@@ -1,3 +1,8 @@
+"""
+by Wei-Bang Jiang
+https://github.com/935963004/NeuroLM
+"""
+
 import os
 import time
 import argparse
@@ -5,12 +10,13 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR, SequentialLR, LinearLR, StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from accelerate import Accelerator, DistributedDataParallelKwargs
 import math
 
-from quantizers import VQ_Align, FSQ_Align
+from quantizers import TokAlign
 from dataset import fMRIDataSet
+import checkpoint_naming as ckpt_naming
 
 
 accelerator = None
@@ -30,30 +36,72 @@ def init(args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+def prepare_tokenizer_config(cfg):
+    if OmegaConf.select(cfg, "model.vq_model") is not None:
+        raise ValueError(
+            "Legacy model.vq_model quantizer configs are no longer supported here. "
+            "Use the unified Tokenizer config with model.quantize_mode instead."
+        )
+
+    if OmegaConf.select(cfg, "model") is None:
+        raise ValueError("Config must contain a model section for the unified Tokenizer.")
+
+    for key in ("num_rois", "num_timestamp"):
+        if OmegaConf.select(cfg, f"model.{key}") is None:
+            raise ValueError(f"Tokenizer config is missing model.{key}.")
+
+    if OmegaConf.select(cfg, "model.quantize_mode") is None:
+        raise ValueError("Tokenizer config is missing model.quantize_mode.")
+
+    if OmegaConf.select(cfg, "model.image_size") is None:
+        cfg.model.image_size = [int(cfg.model.num_rois), int(cfg.model.num_timestamp)]
+
+    if OmegaConf.select(cfg, "model.gate_attention") is None and OmegaConf.select(cfg, "model.gate_attn") is not None:
+        cfg.model.gate_attention = cfg.model.gate_attn
+
+    # rope_mode may be present in unified configs, but this tokenizer path intentionally
+    # uses the non-RoPE transformer block.
+    return cfg, int(cfg.model.image_size[1])
+
+def build_quantizer_model(args, quantizer_cfg):
+    return TokAlign(quantizer_cfg, lm_name=args.lm_name)
+
 def main(args):
     global accelerator
     
     init(args)
-    
+
+    cfg = OmegaConf.load(args.cfg_path)
+    quantizer_cfg, clip_timepoints = prepare_tokenizer_config(cfg)
+
     checkpoint_out_dir = args.ckpt_dir
     if accelerator.is_main_process and not args.no_save_ckpt:
         os.makedirs(checkpoint_out_dir, exist_ok=True)
+        ckpt_naming.write_lineage_json(
+            checkpoint_out_dir,
+            stage='tokenizer',
+            objective='default',
+            checkpoint_dir=checkpoint_out_dir,
+            cfg_path=args.cfg_path,
+            dataset_dir=args.dataset_dir,
+            data_norm=ckpt_naming.data_norm_name(args.dataset_dir, args.norm),
+            lm_name=args.lm_name if args.domain_loss_weight > 0.0 else None,
+            quantize_mode=ckpt_naming.tokenizer_mode_from_config(args.cfg_path),
+            run_name=args.wandb_runname,
+            args=vars(args),
+        )
 
     print('prepare dataloader...')
     total_samples = 0
     train_datset = []
     for dataset_path in args.dataset_dir:
         assert os.path.exists(dataset_path), f"Dataset path {dataset_path} does not exist."
-        dataset = fMRIDataSet(dataset_path, norm=args.norm, GPT_training=False, clip_timepoints=160)
+        dataset = fMRIDataSet(dataset_path, norm=args.norm, GPT_training=False, clip_timepoints=clip_timepoints)
         total_samples += len(dataset)
         train_datset.append(dataset)
     train_datset = torch.utils.data.ConcatDataset(train_datset)
     data_loader_train = torch.utils.data.DataLoader(train_datset, batch_size=args.batch_size, num_workers=16, pin_memory=True, shuffle=True)
     print('finished!')
-
-    # model init
-    quantizer_cfg = OmegaConf.load(args.cfg_path).model.vq_model
-    quantizer_cfg.img_size = (quantizer_cfg.num_rois, quantizer_cfg.num_timestamp)
 
     # text data loader
     data_dir = 'data/text/openwebtext'
@@ -72,29 +120,20 @@ def main(args):
     else:
         init_from = 'scratch'
 
-    if args.quantizer == 'vq':
-        quantizer_cls = VQ_Align
-    elif args.quantizer == 'fsq':
-        quantizer_cls = FSQ_Align
-    elif args.quantizer == 'titok':
-        quantizer_cls = TiTok_Align
-    else:
-        raise ValueError(f"Unknown quantizer type: {args.quantizer}")
-
     # init these up here, can override if init_from='resume'
     iter_num = 0
     best_loss = float('inf')
 
     if init_from == 'scratch':
         print("Initializing a new model from scratch")
-        model = quantizer_cls(quantizer_cfg, lm_name=args.lm_name)
+        model = build_quantizer_model(args, quantizer_cfg)
         start_epoch = 0
     elif init_from == 'resume':
         print(f"Resuming training from {checkpoint_out_dir}")
         ckpt_path = os.path.join(checkpoint_out_dir, 'ckpt.pt')
         checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)  # Load to CPU first
 
-        model = quantizer_cls(quantizer_cfg, lm_name=args.lm_name)
+        model = build_quantizer_model(args, quantizer_cfg)
         state_dict = checkpoint['model']
         
         # Fix state dict keys
@@ -248,7 +287,7 @@ def main(args):
             local_iter_num += 1
 
         # gather logs from processes
-        epoch_log = {k: torch.tensor(v, device=accelerator.device) / (step + 1) for k, v in log.items()}
+        epoch_log = {k: torch.as_tensor(v, device=accelerator.device, dtype=torch.float32) / (step + 1) for k, v in epoch_log.items()}
         epoch_log = accelerator.gather(epoch_log)
         epoch_log = {k: epoch_log[k].mean().item() for k in epoch_log}
 
@@ -268,6 +307,11 @@ def main(args):
 
             # Use accelerator.unwrap_model to get the original model for saving
             if not args.no_save_ckpt:
+                current_loss = epoch_log['train/total_loss']
+                is_best = current_loss < best_loss
+                if is_best:
+                    best_loss = current_loss
+
                 unwrapped_model = accelerator.unwrap_model(model)
                 checkpoint = {
                     'model': unwrapped_model.state_dict(),
@@ -276,10 +320,7 @@ def main(args):
                     'conf': quantizer_cfg,
                     'iter_num': iter_num,
                     'epoch': epoch,
-                    # 'loss': epoch_log['train/total_loss'],
-                    # 'rec_loss': epoch_log['train/rec_raw_loss'],
-                    # 'quant_loss': epoch_log['train/quant_loss'],
-                    # 'domain_loss': epoch_log['train/domain_loss'],
+                    'log': epoch_log,
                     'best_loss': best_loss,
                 }
                 print(f"saving checkpoint to {checkpoint_out_dir}")
@@ -289,11 +330,7 @@ def main(args):
                     print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
                     torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
                 
-                # Save best checkpoint if this is the best loss so far
-                current_loss = epoch_log['train/total_loss']
-                if current_loss < best_loss:
-                    best_loss = current_loss
-                    checkpoint['best_loss'] = best_loss
+                if is_best:
                     print(f"saving best checkpoint with loss {best_loss:.4f} to {checkpoint_out_dir}")
                     torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-best.pt'))
 
@@ -303,16 +340,59 @@ def main(args):
     # End training
     accelerator.end_training()
 
+
+def tokenizer_mode_from_config(cfg_path):
+    cfg = OmegaConf.load(cfg_path)
+    return OmegaConf.select(cfg, "model.quantize_mode") or "tokenizer"
+
+
+def dataset_name_from_paths(dataset_dirs):
+    dataset_name = []
+    for dataset in dataset_dirs:
+        if 'UKB' in dataset:
+            dataset_name.append('UKB')
+        elif 'HCP' in dataset:
+            dataset_name.append('HCP')
+        elif 'ABCD' in dataset:
+            dataset_name.append('ABCD')
+        else:
+            dataset_name.append('custom')
+    return '_'.join(dataset_name)
+
+
+def generate_run_name(args):
+    """Generate checkpoint directory and wandb run name from arguments."""
+    data_norm = ckpt_naming.data_norm_name(args.dataset_dir, args.norm)
+    cfg_basename = ckpt_naming.config_name(args.cfg_path)
+    tokenizer_mode = ckpt_naming.tokenizer_mode_from_config(args.cfg_path)
+
+    components = []
+    if args.run_prefix:
+        components.append(args.run_prefix)
+
+    components.append(f"tok_{tokenizer_mode}-{cfg_basename}")
+
+    if args.domain_loss_weight > 0.0:
+        components.append(f"domain{ckpt_naming.format_float(args.domain_loss_weight)}")
+        components.append(ckpt_naming.simplify_lm_name(args.lm_name))
+
+    run_name = ckpt_naming.join_name_parts(*components)
+    ckpt_dir = ckpt_naming.tokenizer_ckpt_dir('default', data_norm, run_name)
+    print(f"Auto-generated run name: {run_name}")
+
+    return ckpt_dir, run_name
+
 def get_args():
     def list_of_strs(arg):
         return arg.split(',')
-    parser = argparse.ArgumentParser('VQ training script', add_help=False)
-    parser.add_argument('--ckpt_dir', default='./checkpoints/tmp', help='path where to save, empty for no saving')
+    parser = argparse.ArgumentParser('Tokenizer/TokAlign training script', add_help=False)
+    parser.add_argument('--run_prefix', default='', type=str, help='Optional prefix for run name')
+    parser.add_argument('--ckpt_dir', default=None, type=str, help='path where to save, if not provided will be auto-generated')
     parser.add_argument('--dataset_dir', default=['data/UKB/fmri/TianS3/'], type=list_of_strs, help='path to the dataset h5 file')
     parser.add_argument('--log_interval', default=10, type=int)
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='BrainFM_quantizer')
-    parser.add_argument('--wandb_runname', default='VQ_align')
+    parser.add_argument('--wandb_runname', default=None, type=str, help='wandb run name, if not provided will be auto-generated')
     
     # training args
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
@@ -323,9 +403,8 @@ def get_args():
     parser.add_argument('--save_ckpt_freq', default=10, type=int)
     parser.add_argument('--resume', default=False, action='store_true',)
 
-    # quantizer args
-    parser.add_argument('--quantizer', type=str, default='vq')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160.yaml', help='path to the TiTok config file',)
+    # tokenizer args
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160_newTok.yaml', help='path to the tokenizer config file',)
     parser.add_argument('--lm_name', type=str, default='gpt2', help='name of the language model to use')
 
     parser.add_argument('--learning_rate', type=float, default=1e-4, metavar='LR',
@@ -346,7 +425,17 @@ def get_args():
     parser.add_argument('--compile', default=False, action='store_true')
     parser.add_argument('--no_save_ckpt', default=False, action='store_true', help='skip checkpoint directory creation and checkpoint saving')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Auto-generate ckpt_dir and wandb_runname if not provided, matching train_quantizer_contr.py.
+    if args.ckpt_dir is None or args.wandb_runname is None:
+        auto_ckpt_dir, auto_run_name = generate_run_name(args)
+        if args.ckpt_dir is None:
+            args.ckpt_dir = auto_ckpt_dir
+        if args.wandb_runname is None:
+            args.wandb_runname = auto_run_name
+
+    return args
 
 if __name__ == '__main__':
     args = get_args()

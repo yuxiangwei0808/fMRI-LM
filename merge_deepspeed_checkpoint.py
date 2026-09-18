@@ -3,13 +3,17 @@
 Merge DeepSpeed checkpoint components into a standard PyTorch checkpoint.
 
 This script combines:
-1. pytorch_model.bin (model weights from zero_to_fp32.py)
+1. pytorch_model.bin OR sharded pytorch_model-*.bin files (model weights from zero_to_fp32.py)
 2. metadata.pt (model_args and training metrics)
 
 Into a single .pt file that can be loaded with standard PyTorch code.
 
+Handles both:
+- Single file: pytorch_model.bin (for smaller models <2GB)
+- Sharded files: pytorch_model-00001-of-00002.bin, pytorch_model-00002-of-00002.bin, etc. (for larger models)
+
 Usage:
-    # First run zero_to_fp32.py to create pytorch_model.bin:
+    # First run zero_to_fp32.py to create pytorch_model.bin or sharded files:
     cd <deepspeed_checkpoint_dir>
     python zero_to_fp32.py . .
     
@@ -21,21 +25,66 @@ Usage:
 
 import argparse
 import os
+import json
+import glob
 import torch
+from collections import OrderedDict
+
+
+def load_sharded_checkpoint(checkpoint_dir):
+    """
+    Load checkpoint from sharded model files.
+    
+    For large models, PyTorch saves weights across multiple files:
+    - pytorch_model-00001-of-00002.bin
+    - pytorch_model-00002-of-00002.bin
+    - pytorch_model.bin.index.json (maps parameter names to shard files)
+    """
+    index_file = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+    
+    if not os.path.exists(index_file):
+        raise FileNotFoundError(f"Shard index file not found: {index_file}")
+    
+    # Load the index to understand the sharding structure
+    with open(index_file, 'r') as f:
+        index = json.load(f)
+    
+    print(f"Found sharded checkpoint with {len(index['weight_map'])} parameters")
+    
+    # Get unique shard files
+    shard_files = sorted(set(index['weight_map'].values()))
+    print(f"Loading {len(shard_files)} shard files:")
+    
+    # Load all shards and merge
+    state_dict = OrderedDict()
+    for shard_file in shard_files:
+        shard_path = os.path.join(checkpoint_dir, shard_file)
+        print(f"  Loading {shard_file}...")
+        shard_state = torch.load(shard_path, map_location='cpu', weights_only=False)
+        state_dict.update(shard_state)
+        del shard_state  # Free memory
+    
+    print(f"Successfully merged {len(state_dict)} weight tensors from shards")
+    return state_dict
 
 
 def merge_checkpoint(args):
-    """Merge pytorch_model.bin and metadata.pt into a single checkpoint"""
+    """Merge pytorch_model.bin (or sharded files) and metadata.pt into a single checkpoint"""
     
     print(f"Loading checkpoint from: {args.deepspeed_dir}")
     
     # Check for required files
     pytorch_model_path = os.path.join(args.deepspeed_dir, 'pytorch_model.bin')
+    pytorch_model_index = os.path.join(args.deepspeed_dir, 'pytorch_model.bin.index.json')
     metadata_path = os.path.join(args.deepspeed_dir, 'metadata.pt')
     
-    if not os.path.exists(pytorch_model_path):
+    # Detect if we have sharded or single file checkpoint
+    is_sharded = os.path.exists(pytorch_model_index)
+    has_single_file = os.path.exists(pytorch_model_path)
+    
+    if not is_sharded and not has_single_file:
         raise FileNotFoundError(
-            f"pytorch_model.bin not found at: {pytorch_model_path}\n"
+            f"No model weights found at: {args.deepspeed_dir}\n"
             f"Please run zero_to_fp32.py first:\n"
             f"  cd {args.deepspeed_dir}\n"
             f"  python zero_to_fp32.py . ."
@@ -44,10 +93,14 @@ def merge_checkpoint(args):
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"metadata.pt not found at: {metadata_path}")
     
-    # Load model weights
-    print("Loading model weights from pytorch_model.bin...")
-    state_dict = torch.load(pytorch_model_path, map_location='cpu', weights_only=False)
-    print(f"  Loaded {len(state_dict)} weight tensors")
+    # Load model weights - handle both sharded and single file
+    if is_sharded:
+        print("Detected sharded checkpoint (large model)...")
+        state_dict = load_sharded_checkpoint(args.deepspeed_dir)
+    else:
+        print("Loading model weights from single pytorch_model.bin...")
+        state_dict = torch.load(pytorch_model_path, map_location='cpu', weights_only=False)
+        print(f"  Loaded {len(state_dict)} weight tensors")
     
     # Load metadata
     print("Loading metadata from metadata.pt...")
@@ -93,14 +146,26 @@ def merge_checkpoint(args):
     # Save merged checkpoint
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     print(f"\nSaving merged checkpoint to: {args.output_path}")
+    print("  (This may take a few minutes for large models...)")
     torch.save(checkpoint, args.output_path)
     
     # Display file size
     file_size_mb = os.path.getsize(args.output_path) / 1024 / 1024
-    print(f"✓ Successfully saved checkpoint ({file_size_mb:.2f} MB)")
+    file_size_gb = file_size_mb / 1024
+    
+    if file_size_gb >= 1:
+        print(f"✓ Successfully saved checkpoint ({file_size_gb:.2f} GB)")
+    else:
+        print(f"✓ Successfully saved checkpoint ({file_size_mb:.2f} MB)")
+    
     print(f"\nYou can now load this checkpoint with:")
     print(f"  checkpoint = torch.load('{args.output_path}')")
     print(f"  model.load_state_dict(checkpoint['model'])")
+    
+    # Cleanup info for sharded checkpoints
+    if is_sharded:
+        print(f"\nNote: Original sharded files are still in {args.deepspeed_dir}")
+        print(f"      You can delete them to save disk space if desired.")
     print(f"  model_args = checkpoint['model_args']")
 
 

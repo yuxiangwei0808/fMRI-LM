@@ -1,3 +1,7 @@
+"""
+Adapted from https://github.com/935963004/NeuroLM
+"""
+
 import os
 import time
 import math
@@ -7,7 +11,6 @@ import sys
 import json
 import wandb
 from tqdm import tqdm
-from collections import OrderedDict
 from omegaconf import OmegaConf
 import copy
 import colorlog
@@ -20,12 +23,12 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 
 from model_fmrilm import fMRILM
-from quantizers import VQ_Align, FSQ_Align
-from brain_encoder import vit_base
+from quantizers import Tokenizer
 from model_gpt import MultimodalConfig
 from dataset import get_fmri_data, fMRITextDataset
 from utils import combine_attn_mask
 from metrics.text_generation import TextGenerationMetrics
+import checkpoint_naming as ckpt_naming
 
 
 def setup_logging(log_level=logging.INFO, log_file=None):
@@ -103,59 +106,26 @@ def simplify_lm_name(lm_name):
 
 
 def auto_generate_names(args):
-    """Auto-generate checkpoint directory and wandb run name based on training configuration.
-    
-    The wandb run name is set to the checkpoint directory basename so they always match.
-    The full configuration (including LoRA hyperparams) is saved to the checkpoint directory
-    via save_args_to_json.
-    """
-    # Simplify LM name
-    lm_short = simplify_lm_name(args.lm_name)
-
-    dataset_name = []
-    for dataset in args.dataset_dir:
-        if 'UKB' in dataset:
-            dataset_name.append('UKB')
-        elif 'HCP' in dataset:
-            dataset_name.append('HCP')
-        elif 'ABCD' in dataset:
-            dataset_name.append('ABCD')
-        else:
-            raise ValueError(f"Unknown dataset in path: {dataset}")
-    dataset_name = '_'.join(dataset_name)
-    dataset_name += f'-{args.norm}' if args.norm else ''
-    
-    # Create descriptor type string
+    """Auto-generate checkpoint directory and wandb run name based on training configuration."""
+    data_norm = ckpt_naming.data_norm_name(args.dataset_dir, args.norm)
     desc_str = '_'.join(args.desc_type) if isinstance(args.desc_type, list) else args.desc_type
     
-    # Create objective weights string
     objectives = []
     if args.fmri_only_weight > 0:
-        objectives.append(f"fmri{args.fmri_only_weight}")
+        objectives.append(f"fmri{ckpt_naming.format_float(args.fmri_only_weight)}")
     if args.text_only_weight > 0:
-        objectives.append(f"text{args.text_only_weight}")
+        objectives.append(f"text{ckpt_naming.format_float(args.text_only_weight)}")
     if args.fmri2text_weight > 0:
-        objectives.append(f"f2t{args.fmri2text_weight}")
+        objectives.append(f"f2t{ckpt_naming.format_float(args.fmri2text_weight)}")
     if args.text2fmri_weight > 0:
-        objectives.append(f"t2f{args.text2fmri_weight}")
+        objectives.append(f"t2f{ckpt_naming.format_float(args.text2fmri_weight)}")
     
     obj_str = '_'.join(objectives) if objectives else "noobj"
+    base_name = ckpt_naming.sanitize_component(f"{desc_str}_{obj_str}")
+    run_name = ckpt_naming.append_postfix_and_timestamp(base_name, postfix=args.ckpt_postfix, add_timestamp=True)
+    ckpt_dir = ckpt_naming.pretrain_ckpt_dir(data_norm, args.lm_name, run_name)
     
-    # Generate base name
-    base_name = f"{desc_str}_{obj_str}_{lm_short}"
-    base_name += f'_{args.ckpt_postfix}' if args.ckpt_postfix else ''
-    
-    # Add timestamp
-    timestamp = datetime.now().strftime("%m%d_%H%M%S")
-    
-    # Generate checkpoint directory
-    run_name = f"{base_name}_{timestamp}"
-    ckpt_dir = os.path.join("checkpoints", "pretrain", dataset_name, run_name)
-    
-    # wandb run name matches the checkpoint directory basename
-    wandb_runname = run_name
-    
-    return ckpt_dir, wandb_runname
+    return ckpt_dir, run_name
 
 
 def save_args_to_json(args, save_dir):
@@ -176,6 +146,141 @@ def save_args_to_json(args, save_dir):
         json.dump(serializable_dict, f, indent=4, sort_keys=True)
     
     return json_path
+
+
+def prepare_tokenizer_config(cfg):
+    if OmegaConf.select(cfg, "model.vq_model") is not None:
+        raise ValueError(
+            "Legacy model.vq_model configs are no longer supported in this stage. "
+            "Use the unified Tokenizer config with model.quantize_mode instead."
+        )
+    if OmegaConf.select(cfg, "model") is None or OmegaConf.select(cfg, "lm") is None:
+        raise ValueError("Tokenizer configs must contain top-level model and lm sections.")
+    for key in ("num_rois", "num_timestamp", "quantize_mode", "vit_enc_patch_size"):
+        if OmegaConf.select(cfg, f"model.{key}") is None:
+            raise ValueError(f"Tokenizer config is missing model.{key}.")
+    if OmegaConf.select(cfg, "model.image_size") is None:
+        cfg.model.image_size = [int(cfg.model.num_rois), int(cfg.model.num_timestamp)]
+    if OmegaConf.select(cfg, "model.gate_attention") is None and OmegaConf.select(cfg, "model.gate_attn") is not None:
+        cfg.model.gate_attention = cfg.model.gate_attn
+    return cfg
+
+
+def strip_compile_prefix(state_dict):
+    state_dict = dict(state_dict)
+    for prefix in ('_orig_mod.', 'module.'):
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix):
+                state_dict[key[len(prefix):]] = state_dict.pop(key)
+    return state_dict
+
+
+def checkpoint_model_state(checkpoint):
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        return checkpoint['model']
+    return checkpoint
+
+
+def strip_prefix_if_present(state_dict, prefix):
+    prefix = prefix.rstrip('.') + '.'
+    stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    return stripped if stripped else None
+
+
+def map_mae_encoder_to_tokenizer_state(state_dict, expected):
+    candidates = [state_dict]
+    for prefix in ('mae', 'encoder', 'backbone'):
+        stripped = strip_prefix_if_present(state_dict, prefix)
+        if stripped is not None:
+            candidates.append(stripped)
+
+    best_mapped = {}
+    for candidate in candidates:
+        mapped = {}
+        for key, value in candidate.items():
+            new_key = None
+            new_value = value
+            if key.startswith('patch_embed.') or key.startswith('blocks.'):
+                new_key = f'encoder.{key}'
+            elif key.startswith('norm.'):
+                new_key = f"encoder.ln_post.{key[len('norm.'):]}"
+            elif key == 'pos_embed':
+                new_key = 'encoder.pos_embed'
+            elif key == 'cls_token':
+                new_key = 'encoder.cls_embed'
+                if value.ndim == 3 and value.shape[1] == 1:
+                    new_value = value.squeeze(1)
+
+            if new_key in expected and expected[new_key].shape == new_value.shape:
+                mapped[new_key] = new_value
+
+        if len(mapped) > len(best_mapped):
+            best_mapped = mapped
+    return best_mapped
+
+
+def load_tokenizer_state(tokenizer, checkpoint, logger):
+    state_dict = strip_compile_prefix(checkpoint_model_state(checkpoint))
+    expected = tokenizer.state_dict()
+    candidates = [('raw', state_dict)]
+    for prefix in (
+        'quantizer',
+        'fmri_model.quantizer',
+        'module.quantizer',
+        'module.fmri_model.quantizer',
+        'tokenizer',
+        'module.tokenizer',
+    ):
+        stripped = strip_prefix_if_present(state_dict, prefix)
+        if stripped is not None:
+            candidates.append((prefix, stripped))
+
+    mae_mapped = map_mae_encoder_to_tokenizer_state(state_dict, expected)
+    if mae_mapped:
+        candidates.append(('mae_encoder', mae_mapped))
+
+    def score(candidate):
+        _, sd = candidate
+        return sum(k in expected and expected[k].shape == v.shape for k, v in sd.items())
+
+    best_name, best = max(candidates, key=score)
+    filtered = {k: v for k, v in best.items() if k in expected and expected[k].shape == v.shape}
+    if not filtered:
+        raise ValueError("No tokenizer checkpoint keys matched the unified Tokenizer state dict.")
+
+    msg = tokenizer.load_state_dict(filtered, strict=False)
+    tokenizer._checkpoint_source = best_name
+    tokenizer._loaded_from_mae_encoder = best_name == 'mae_encoder'
+    logger.info(
+        f"Tokenizer state loaded from {best_name}: matched={len(filtered)}, "
+        f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}"
+    )
+    if best_name == 'mae_encoder':
+        logger.info(
+            "Loaded MAE encoder weights into Tokenizer.encoder; "
+            "Tokenizer decoder and quantizer parameters remain initialized from cfg."
+        )
+    else:
+        core_missing = [k for k in msg.missing_keys if k.startswith(('encoder.', 'quantize.'))]
+        if core_missing:
+            logger.warning(f"Tokenizer core missing keys after load: {core_missing[:10]}")
+    return msg
+
+
+class TokenizerEncoderForLM(torch.nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+        self.patch_embed = encoder.patch_embed
+        self.num_patches = encoder.num_patches
+        self.embed_dim = encoder.width
+
+    def forward(self, x):
+        encoder_param = next(self.encoder.parameters(), None)
+        if encoder_param is not None:
+            x = x.to(device=encoder_param.device, dtype=encoder_param.dtype)
+        features, _ = self.encoder(x)
+        return features.permute(0, 2, 1)
 
 
 def main(args):
@@ -237,7 +342,22 @@ def main(args):
     
     # Save arguments to JSON file (includes LoRA hyperparams from CLI overrides)
     json_path = save_args_to_json(args, args.ckpt_dir)
+    tokenizer_run_dir = ckpt_naming.checkpoint_run_dir(args.tokenizer_path)
+    lineage_path = ckpt_naming.write_lineage_json(
+        args.ckpt_dir,
+        stage='pretrain',
+        checkpoint_dir=args.ckpt_dir,
+        tokenizer_checkpoint=args.tokenizer_path,
+        tokenizer_run=os.path.basename(tokenizer_run_dir),
+        cfg_path=args.cfg_path,
+        dataset_dir=args.dataset_dir,
+        data_norm=ckpt_naming.data_norm_name(args.dataset_dir, args.norm),
+        lm_name=args.lm_name,
+        run_name=os.path.basename(args.ckpt_dir),
+        args=vars(args),
+    )
     logger.info(f"Training arguments saved to: {json_path}")
+    logger.info(f"Lineage metadata saved to: {lineage_path}")
     logger.info(f"Checkpoint directory: {args.ckpt_dir}")
     logger.info(f"W&B run name: {args.wandb_runname}")
     
@@ -348,11 +468,11 @@ def main(args):
             y[idx] = torch.from_numpy(dummy_data[i+1:i+1+num_token].astype(np.int64))
         return x, y
 
-    # Load tokenizer
-    model_cfg = OmegaConf.load(args.cfg_path).model
-    quantizer_cfg = model_cfg.vq_model
-    quantizer_cfg.img_size = (quantizer_cfg.num_rois, quantizer_cfg.num_timestamp)
-    lm_cfg = copy.deepcopy(model_cfg.lm)
+    # Load tokenizer config
+    cfg = prepare_tokenizer_config(OmegaConf.load(args.cfg_path))
+    quantizer_cfg = cfg.model
+    lm_cfg = copy.deepcopy(cfg.lm)
+    patch_size = int(quantizer_cfg.vit_enc_patch_size)
 
     try:
         dataset_train, dataset_val = get_fmri_data(args.dataset_dir,
@@ -361,8 +481,8 @@ def main(args):
                                                    val_ratio=0.1,
                                                    norm=args.norm, 
                                                    GPT_training=True, 
-                                                   patch_size=quantizer_cfg.patch_size, 
-                                                   next_time_mask=(args.quantizer != 'titok'),
+                                                   patch_size=patch_size,
+                                                   next_time_mask=True,
                                                    descriptor_types=args.desc_type, 
                                                    lm_name=args.lm_name,
                                                    max_len=600,
@@ -422,49 +542,14 @@ def main(args):
         logger.error(f"Failed to load tokenizer checkpoint: {e}")
         raise
 
-    # tokenizer_state_dict = tokenizer_checkpoint['model']
-    tokenizer_state_dict = tokenizer_checkpoint
-    # Clean up state dict
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(tokenizer_state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            tokenizer_state_dict[k[len(unwanted_prefix):]] = tokenizer_state_dict.pop(k)
-    
-    if args.quantizer == 'vq':
-        model_cls = VQ_Align
-    elif args.quantizer == 'fsq':
-        model_cls = FSQ_Align
-
-    # Create tokenizer
-    model_align = model_cls(quantizer_cfg, args.lm_name)
-    
-    # try:
-    #     msg = model_align.load_state_dict(tokenizer_state_dict, strict=False)
-    #     missing_keys = [k for k in msg.missing_keys if 'quantizer.' in k or 'VQ.' in k or 'base_model.' in k]
-    #     assert not missing_keys, f"Missing keys when loading tokenizer: {missing_keys}."
-    #     logger.info("Tokenizer loaded successfully from checkpoint")
-    # except Exception as e:
-    #     all_keys = list(tokenizer_state_dict.keys())
-    #     new_dict = OrderedDict()
-    #     for key in all_keys:
-    #         if key.startswith('fmri_model.') and not key.startswith('text_model.'):
-    #             new_dict[key[len('fmri_model.'):]] = tokenizer_state_dict[key]
-    #         elif key.startswith('VQ.'):  # backward compatibility as the module was renamed to quantizer
-    #             cur_key = key.replace('VQ.', 'quantizer.')
-    #             new_dict[cur_key] = tokenizer_state_dict[key]
-
-    #     msg = model_align.load_state_dict(new_dict, strict=False)
-    #     missing_keys = [k for k in msg.missing_keys if 'quantizer.' in k or 'VQ.' in k or 'base_model.' in k]
-    #     assert not missing_keys, f"Missing keys when loading tokenizer: {missing_keys}. Current dict: {list(new_dict.keys())}"
-    #     logger.info("Tokenizer state dict loaded and cleaned successfully")
-    model_align.quantizer.load_state_dict(tokenizer_state_dict, strict=False)
-    
-    if args.quantizer:
-        tokenizer = model_align.quantizer
-        tokenizer_encoder = copy.deepcopy(tokenizer.encoder)
-    else:  # continuous tokenizer
-        tokenizer = model_align
-        tokenizer_encoder = copy.deepcopy(tokenizer.base_model)
+    tokenizer = Tokenizer(cfg)
+    load_tokenizer_state(tokenizer, tokenizer_checkpoint, logger)
+    if getattr(tokenizer, '_loaded_from_mae_encoder', False) and (args.fmri_only_weight > 0 or args.text2fmri_weight > 0):
+        logger.warning(
+            "MAE checkpoints only provide encoder weights. fMRI-token prediction objectives "
+            "will use the cfg-initialized tokenizer quantizer/codebook."
+        )
+    tokenizer_encoder = TokenizerEncoderForLM(copy.deepcopy(tokenizer.encoder))
 
     tokenizer.eval()
     logger.info("Tokenizer set to evaluation mode")
@@ -499,15 +584,18 @@ def main(args):
         logger.info("Initializing from pretrained weights")
 
     num_tokens = tokenizer_encoder.num_patches
-    num_chans = quantizer_cfg.num_rois
+    num_chans = int(quantizer_cfg.num_rois)
 
     iter_num = 0
     best_f2t_loss = float('inf')
-    n_embd = quantizer_cfg.n_embd
+    n_embd = tokenizer_encoder.embed_dim
 
     fmri_vocab_size = tokenizer.codebook_size if hasattr(tokenizer, 'codebook_size') else 0
     if fmri_vocab_size:
-        assert lm_cfg.fmri_vocab_size == fmri_vocab_size, "fmri_vocab_size in lm_cfg does not match tokenizer codebook size"
+        if lm_cfg.fmri_vocab_size != fmri_vocab_size:
+            logger.warning(f"Overriding lm.fmri_vocab_size from {lm_cfg.fmri_vocab_size} to tokenizer codebook size {fmri_vocab_size}")
+        lm_cfg.fmri_vocab_size = fmri_vocab_size
+    lm_cfg.num_fmri_tokens = num_tokens
     lm_cfg.base_model = args.lm_name
 
     # Override LoRA hyperparameters from CLI args (if provided)
@@ -731,14 +819,14 @@ def main(args):
             loss_text, log_text, _ = model(None, None, X_text, Y_text)
         
         if args.fmri2text_weight > 0:  # fMRI -> text, description (NOT semantic QA)
-            attention_mask = combine_attn_mask(fmri_gpt_mask, text_attention_mask)
             Y_text_input_ids = text_input_ids.clone()
             # make all padded token -1
             Y_text_input_ids[text_attention_mask == 0] = -1
             Y_text_input_ids[:, :-1] = Y_text_input_ids[:, 1:].clone()  # next token prediction
             Y_fmri_f2t = torch.full((X_fmri.size(0), num_tokens), fill_value=-1-vocab_size, device=accelerator.device)
             
-            loss_f2t, log_f2t, _ = model(X_fmri, Y_fmri_f2t, text_input_ids, Y_text_input_ids, attention_mask)
+            # Pass raw masks as tuple; _prepare_inputs will handle combining and interleaving
+            loss_f2t, log_f2t, _ = model(X_fmri, Y_fmri_f2t, text_input_ids, Y_text_input_ids, (fmri_gpt_mask, text_attention_mask))
         
         if args.text2fmri_weight > 0:
             raise Exception("text2fmri not supported yet")
@@ -768,22 +856,19 @@ def main(args):
                                         fill_value=-1 if gptconf.use_fmri_lm_head else -1-vocab_size,
                                         device=accelerator.device)
                     
-                    if args.quantizer:
-                        # Handle both DeepSpeed (not wrapped) and DDP (wrapped with .module)
-                        if args.deepspeed or accelerator.num_processes == 1:
-                            codebook_indices = tokenizer.get_codebook_indices(X_fmri)
-                        else:
-                            codebook_indices = tokenizer.module.get_codebook_indices(X_fmri)
-
-                        # next timestamp prediction; use the ROIs from the prev timestamp to predict ROIs for the next timestamp
-                        # TODO this assume a 1v1 correspondance between the ROI from adjacent timestamp, try generalize this?
-                        if num_tokens == num_chans:
-                            Y_fmri = codebook_indices
-                        else:
-                            for i in range(len(codebook_indices)):
-                                Y_fmri[i, :num_tokens - num_chans] = codebook_indices[i, num_chans:num_tokens]
+                    # Handle both DeepSpeed (not wrapped) and DDP (wrapped with .module)
+                    if args.deepspeed or accelerator.num_processes == 1:
+                        codebook_indices = tokenizer.get_codebook_indices(X_fmri)
                     else:
-                        Y_fmri = None
+                        codebook_indices = tokenizer.module.get_codebook_indices(X_fmri)
+
+                    # next timestamp prediction; use the ROIs from the prev timestamp to predict ROIs for the next timestamp
+                    # TODO this assume a 1v1 correspondance between the ROI from adjacent timestamp, try generalize this?
+                    if num_tokens == num_chans:
+                        Y_fmri = codebook_indices
+                    else:
+                        for i in range(len(codebook_indices)):
+                            Y_fmri[i, :num_tokens - num_chans] = codebook_indices[i, num_chans:num_tokens]
 
             # DeepSpeed handles gradient accumulation internally, don't use accelerator.accumulate()
             if args.deepspeed:
@@ -1105,15 +1190,9 @@ def evaluate(model, tokenizer, dataloader, accelerator, args, logger, vocab_size
         # Let accelerator handle mixed precision casting automatically
         fmri_gpt_mask = fmri_gpt_mask.to(X_fmri.dtype)
 
-        attention_mask = combine_attn_mask(fmri_gpt_mask, text_attention_mask)  # (B, L, L)
+        # Pass raw masks as tuple; _prepare_inputs will handle combining and interleaving
+        attention_mask = (fmri_gpt_mask, text_attention_mask)
         
-        # move the right side mask of attention_mask to the left side (if any padding in the prompt)
-        for i in range(len(X_fmri)):
-            pad_len = text_attention_mask[i].size(0) - text_attention_mask[i].sum().item()
-            if pad_len > 0:
-                attention_mask[i] = torch.roll(attention_mask[i], shifts=pad_len, dims=0)
-                attention_mask[i] = torch.roll(attention_mask[i], shifts=pad_len, dims=1)
-
         Y_text_input_ids = text_input_ids.clone()
         # make all padded token -1
         Y_text_input_ids[text_attention_mask == 0] = -1
@@ -1184,7 +1263,7 @@ def get_args():
     parser = argparse.ArgumentParser('NeuroLM training script', add_help=False)
     parser.add_argument('--dataset_dir', default=['data/UKB/fmri/TianS3/'], type=list_of_strs, help='path to the dataset directory')
     parser.add_argument('--norm', type=str, default='robust', help='normalization method')
-    parser.add_argument('--tokenizer_path', default='checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160/ckpt-best.pt', help='path where tokenizer is')
+    parser.add_argument('--tokenizer_path', default='checkpoints/tokenizer/default/UKB-robust/tok_fsq-vit_base_p160_newTok/ckpt-best.pt', help='path where tokenizer is')
     parser.add_argument('--ckpt_dir', default='tmp', help='path where to save. If set to "tmp" (default), will auto-generate based on training config')
     parser.add_argument('--ckpt_postfix', default='', help='optional postfix to add to checkpoint directory name')
     parser.add_argument('--resume', default=False, action='store_true', help='resume from the latest checkpoint')
@@ -1212,8 +1291,7 @@ def get_args():
     parser.add_argument('--fmri2text_weight', type=float, help='weight for fMRI -> text NTP objective', default=1)
     parser.add_argument('--text2fmri_weight', type=float, help='weight for text -> fMRI NTP objective', default=0)
 
-    parser.add_argument('--quantizer', type=str, default='')
-    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160.yaml', help='path to the TiTok config file',)
+    parser.add_argument('--cfg_path', type=str, default='configs/vit_base_p160_newTok.yaml', help='path to the tokenizer config file',)
 
     # LoRA hyperparameters (override YAML defaults when provided)
     parser.add_argument('--no_lora', action='store_true', default=False, help='disable LoRA and fine-tune the entire model')

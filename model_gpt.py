@@ -278,51 +278,227 @@ class MultimodalLLM(nn.Module):
                 f"fMRI sequence length {x_fmri.shape[1]} exceeds max {self.config.num_fmri_tokens}"
             
             text_ids = x_text.input_ids if hasattr(x_text, 'input_ids') else x_text
-            x_text = self.base_model.get_input_embeddings()(text_ids)
-
-            pos_ids = torch.arange(0, x_fmri.shape[1]//self.config.num_rois, dtype=torch.long).repeat_interleave(self.config.num_rois).to(x_fmri.device)
-
-            if self.config.add_fmri_delimiter:
-                fmri_start, fmri_end = self.tokenizer.encode(self.fmri_start, return_tensors='pt').to(x_fmri.device), self.tokenizer.encode(self.fmri_end, return_tensors='pt').to(x_fmri.device)
-                fmri_start, fmri_end = self.base_model.get_input_embeddings()(fmri_start), self.base_model.get_input_embeddings()(fmri_end)
-                len_start, len_end = fmri_start.size(1), fmri_end.size(1)
-                fmri_start_mask, fmri_end_mask = torch.tril(torch.ones(len_start, len_start)).unsqueeze(0).repeat(x_fmri.size(0), 1, 1).to(x_fmri.device), torch.tril(torch.ones(len_end, len_end)).unsqueeze(0).repeat(x_fmri.size(0), 1, 1).to(x_fmri.device)
-                
-                # adjust attention_mask first
-                fmri_mask = torch.vmap(torch.block_diag, in_dims=(0, 0, 0))(fmri_start_mask, attention_mask[:, :x_fmri.size(1), :x_fmri.size(1)], fmri_end_mask)
-                fmri_mask[:, len_start:, :len_start] = 1
-                fmri_mask[:, -len_end:, :-len_end] = 1
-                attention_mask = combine_attn_mask(fmri_mask, attention_mask[:, x_fmri.size(1):, x_fmri.size(1):])
-                
-                # add the tag tokens to x_fmri and adjust y_fmri
-                x_fmri = torch.cat([fmri_start.repeat(x_fmri.size(0), 1, 1), x_fmri, fmri_end.repeat(x_fmri.size(0), 1, 1)], dim=1)
-                if y_fmri is not None: y_fmri = torch.cat([torch.full((y_fmri.size(0), len_start), -1 - self.original_vocab_size, dtype=y_fmri.dtype).to(y_fmri.device), y_fmri, torch.full((y_fmri.size(0), len_end), -1 - self.original_vocab_size, dtype=y_fmri.dtype).to(y_fmri.device)], dim=1)
-                
-                # adjust pos_ids
-                pos_ids += len_start
-                pos_ids = torch.cat([torch.arange(0, len_start, dtype=torch.long).to(x_fmri.device), 
-                                     pos_ids, 
-                                     torch.arange(pos_ids.max()+1, pos_ids.max()+1+len_end, dtype=torch.long).to(x_fmri.device)], 
-                                     dim=-1)
-
-            text_pos_ids = torch.arange(0, x_text.size(1), dtype=torch.long).to(x_fmri.device)
-            pos_ids = torch.cat([pos_ids, text_pos_ids + pos_ids.max() + 1], dim=-1)
-            pos_ids = pos_ids.unsqueeze(0).expand(x_fmri.shape[0], -1)  # (batch_size, seq_len)
-
-            # Concatenate: [fMRI_tokens] + [text_tokens]
-            x = torch.cat([x_fmri, x_text], dim=1)
             
-            assert attention_mask is not None and attention_mask.ndim == 3, "Must provide a 3D attention_mask for multimodal input"
-            attention_mask = attention_mask.unsqueeze(1)
-
-            if y_fmri is None and y_text is None:
-                targets = None
-            elif y_fmri == 'nan' and y_text == 'nan':
-                targets = 'nan'
+            # Unpack attention_mask: if a tuple, it contains (fmri_mask, text_mask) 
+            # that need to be combined here; otherwise it's already combined
+            if isinstance(attention_mask, (tuple, list)):
+                fmri_mask_raw, text_mask_raw = attention_mask
+                attention_mask_pre_combined = False
             else:
-                y_fmri = y_fmri + self.original_vocab_size
-                assert y_fmri.max() == -1, "No loss should be computed on fMRI tokens during instruction tuning"
-                targets = torch.cat((y_fmri, y_text), dim=-1)
+                attention_mask_pre_combined = True
+
+            # Detect chat-template models (e.g., Qwen) by checking for <|im_start|> token
+            # For these models, we interleave fMRI inside the chat template: [prefix, fMRI, suffix]
+            # For GPT-2 style models, we keep the original [fMRI, text] order   
+            im_start_token_id = self.tokenizer.convert_tokens_to_ids('<|im_start|>')
+            use_interleave = (im_start_token_id is not None 
+                              and isinstance(im_start_token_id, int) 
+                              and im_start_token_id != self.tokenizer.unk_token_id)
+            
+            if use_interleave:
+                # Find the split point: right after "<|im_start|>user\n"
+                # We look for the first <|im_start|> token and then find the newline after "user"
+                # The prefix will be embedded and placed BEFORE fMRI tokens
+                # text_ids shape: (B, L_text)
+                batch_size = text_ids.shape[0]
+                
+                # Find first <|im_start|> position (should be same across batch since template is fixed)
+                first_sample = text_ids[0]
+                im_start_positions = (first_sample == im_start_token_id).nonzero(as_tuple=True)[0]
+                
+                im_start_pos = im_start_positions[0].item()
+                # The prefix is "<|im_start|>user\n" — find the newline token after im_start
+                # Typically this is im_start_pos + 2 (im_start, "user", \n) but let's find it robustly
+                # by looking for the newline token in the few tokens after im_start
+                newline_token_id = self.tokenizer.encode('\n', add_special_tokens=False)
+                if len(newline_token_id) == 1:
+                    newline_token_id = newline_token_id[0]
+                    # Search for first newline after im_start (within a small window)
+                    split_pos = None
+                    for offset in range(1, min(5, first_sample.shape[0] - im_start_pos)):
+                        if first_sample[im_start_pos + offset].item() == newline_token_id:
+                            split_pos = im_start_pos + offset + 1  # include the newline in prefix
+                            break
+                    if split_pos is None:
+                        split_pos = im_start_pos + 1  # fallback: split right after <|im_start|>
+                else:
+                    # No <|im_start|> found despite use_interleave
+                    raise ValueError("use_interleave is True but <|im_start|> token not found in tokenizer. Check if the model is a chat-template model and if the tokenizer is correct.")
+            
+            if use_interleave:
+                # Split text into prefix and suffix
+                prefix_ids = text_ids[:, :split_pos]  # (B, L_prefix)
+                suffix_ids = text_ids[:, split_pos:]   # (B, L_suffix)
+                
+                prefix_embeds = self.base_model.get_input_embeddings()(prefix_ids)  # (B, L_prefix, D)
+                suffix_embeds = self.base_model.get_input_embeddings()(suffix_ids)  # (B, L_suffix, D)
+                
+                L_prefix = prefix_ids.shape[1]
+                L_fmri = x_fmri.shape[1]
+                L_suffix = suffix_ids.shape[1]
+                
+                # Handle fMRI delimiters if enabled
+                if self.config.add_fmri_delimiter:
+                    fmri_start_ids = self.tokenizer.encode(self.fmri_start, return_tensors='pt').to(x_fmri.device)
+                    fmri_end_ids = self.tokenizer.encode(self.fmri_end, return_tensors='pt').to(x_fmri.device)
+                    fmri_start_embeds = self.base_model.get_input_embeddings()(fmri_start_ids)  # (1, len_start, D)
+                    fmri_end_embeds = self.base_model.get_input_embeddings()(fmri_end_ids)      # (1, len_end, D)
+                    len_start, len_end = fmri_start_embeds.size(1), fmri_end_embeds.size(1)
+                    
+                    # Wrap fMRI embeddings with delimiter embeddings
+                    x_fmri = torch.cat([fmri_start_embeds.repeat(x_fmri.size(0), 1, 1), 
+                                        x_fmri, 
+                                        fmri_end_embeds.repeat(x_fmri.size(0), 1, 1)], dim=1)
+                    
+                    # Wrap fMRI mask with delimiter masks
+                    if not attention_mask_pre_combined:
+                        fmri_start_mask = torch.tril(torch.ones(len_start, len_start, device=x_fmri.device)).unsqueeze(0).repeat(batch_size, 1, 1)
+                        fmri_end_mask = torch.tril(torch.ones(len_end, len_end, device=x_fmri.device)).unsqueeze(0).repeat(batch_size, 1, 1)
+                        fmri_mask_raw = torch.vmap(torch.block_diag, in_dims=(0, 0, 0))(fmri_start_mask, fmri_mask_raw, fmri_end_mask)
+                        fmri_mask_raw[:, len_start:, :len_start] = 1
+                        fmri_mask_raw[:, -len_end:, :-len_end] = 1
+                    
+                    # Adjust y_fmri for delimiters (no loss on delimiter tokens)
+                    if y_fmri is not None and y_fmri != 'nan':
+                        y_fmri = torch.cat([
+                            torch.full((y_fmri.size(0), len_start), -1 - self.original_vocab_size, dtype=y_fmri.dtype, device=y_fmri.device),
+                            y_fmri,
+                            torch.full((y_fmri.size(0), len_end), -1 - self.original_vocab_size, dtype=y_fmri.dtype, device=y_fmri.device)
+                        ], dim=1)
+                    
+                    # Update L_fmri to include delimiters
+                    L_fmri = x_fmri.shape[1]
+                
+                # Build attention mask: [prefix, fMRI, suffix]
+                # prefix is causal, fMRI uses its block mask, suffix is causal
+                # everything attends to everything before it
+                if not attention_mask_pre_combined:
+                    fmri_mask = fmri_mask_raw  # (B, L_fmri, L_fmri)
+                    text_mask = text_mask_raw   # (B, L_text) — 1D padding mask
+                    
+                    L_total = L_prefix + L_fmri + L_suffix
+                    new_mask = torch.zeros((batch_size, L_total, L_total), device=x_fmri.device, dtype=x_fmri.dtype)
+                    
+                    # 1. Prefix attends to itself causally
+                    prefix_causal = torch.tril(torch.ones(L_prefix, L_prefix, device=x_fmri.device))
+                    new_mask[:, :L_prefix, :L_prefix] = prefix_causal
+                    
+                    # 2. fMRI block: uses its own mask (block-diagonal within timestamps)
+                    new_mask[:, L_prefix:L_prefix+L_fmri, L_prefix:L_prefix+L_fmri] = fmri_mask
+                    
+                    # 3. fMRI attends to prefix
+                    new_mask[:, L_prefix:L_prefix+L_fmri, :L_prefix] = 1.0
+                    
+                    # 4. Suffix attends to itself causally, respecting padding
+                    # text_mask covers the original full text [prefix_part + suffix_part]
+                    # The suffix padding mask corresponds to text_mask[:, split_pos:]
+                    suffix_text_mask = text_mask[:, split_pos:]  # (B, L_suffix)
+                    suffix_causal = torch.tril(torch.ones(L_suffix, L_suffix, device=x_fmri.device))
+                    suffix_region = suffix_causal.unsqueeze(0) * suffix_text_mask.unsqueeze(1) * suffix_text_mask.unsqueeze(2)
+                    new_mask[:, L_prefix+L_fmri:, L_prefix+L_fmri:] = suffix_region
+                    
+                    # 5. Suffix attends to prefix and fMRI (non-padded suffix tokens attend to all prior)
+                    suffix_nonpad = suffix_text_mask.unsqueeze(2)  # (B, L_suffix, 1)
+                    new_mask[:, L_prefix+L_fmri:, :L_prefix+L_fmri] = suffix_nonpad.expand(-1, -1, L_prefix+L_fmri)
+                    
+                    attention_mask = new_mask
+                else:
+                    raise NotImplementedError("Pre-combined attention mask for interleaved input not implemented yet. Please provide separate fmri_mask and text_mask as a tuple and set attention_mask_pre_combined=False.")
+                
+                # Construct x: [prefix_embeds, fmri_embeds, suffix_embeds]
+                x = torch.cat([prefix_embeds, x_fmri, suffix_embeds], dim=1)
+                
+                # Position IDs
+                prefix_pos = torch.arange(0, L_prefix, dtype=torch.long, device=x_fmri.device)
+                if self.config.add_fmri_delimiter:
+                    # fMRI pos_ids: delimiter_start gets sequential pos, then ROI-based pos for fMRI body, then delimiter_end
+                    fmri_body_pos = torch.arange(0, (L_fmri - len_start - len_end) // self.config.num_rois, dtype=torch.long).repeat_interleave(self.config.num_rois).to(x_fmri.device)
+                    fmri_body_pos = fmri_body_pos + prefix_pos[-1] + 1 + len_start
+                    start_pos = torch.arange(prefix_pos[-1] + 1, prefix_pos[-1] + 1 + len_start, dtype=torch.long, device=x_fmri.device)
+                    end_pos = torch.arange(fmri_body_pos.max() + 1, fmri_body_pos.max() + 1 + len_end, dtype=torch.long, device=x_fmri.device)
+                    fmri_pos = torch.cat([start_pos, fmri_body_pos, end_pos], dim=-1)
+                else:
+                    fmri_pos = torch.arange(0, L_fmri // self.config.num_rois, dtype=torch.long).repeat_interleave(self.config.num_rois).to(x_fmri.device)
+                    fmri_pos = fmri_pos + prefix_pos[-1] + 1
+                suffix_pos = torch.arange(0, L_suffix, dtype=torch.long, device=x_fmri.device) + fmri_pos.max() + 1
+                pos_ids = torch.cat([prefix_pos, fmri_pos, suffix_pos], dim=-1)
+                pos_ids = pos_ids.unsqueeze(0).expand(batch_size, -1)
+                
+                # Targets: rearrange to match [prefix, fmri, suffix] order
+                if y_fmri is None and y_text is None:
+                    targets = None
+                elif y_fmri == 'nan' and y_text == 'nan':
+                    targets = 'nan'
+                else:
+                    y_fmri = y_fmri + self.original_vocab_size
+                    assert y_fmri.max() == -1, "No loss should be computed on fMRI tokens during instruction tuning"
+                    # y_text corresponds to original text order; split and rearrange
+                    y_prefix = torch.full((batch_size, L_prefix), -1, dtype=y_text.dtype, device=y_text.device)
+                    y_suffix = y_text[:, split_pos:]
+                    targets = torch.cat((y_prefix, y_fmri, y_suffix), dim=-1)
+                
+                # Store the split info for generate() to know the new fmri position
+                self._interleave_prefix_len = L_prefix
+                
+                attention_mask = attention_mask.unsqueeze(1)
+            else:
+                # Original [fMRI, text] order (GPT-2 style)
+                x_text_embeds = self.base_model.get_input_embeddings()(text_ids)
+
+                pos_ids = torch.arange(0, x_fmri.shape[1]//self.config.num_rois, dtype=torch.long).repeat_interleave(self.config.num_rois).to(x_fmri.device)
+
+                if self.config.add_fmri_delimiter:
+                    fmri_start, fmri_end = self.tokenizer.encode(self.fmri_start, return_tensors='pt').to(x_fmri.device), self.tokenizer.encode(self.fmri_end, return_tensors='pt').to(x_fmri.device)
+                    fmri_start, fmri_end = self.base_model.get_input_embeddings()(fmri_start), self.base_model.get_input_embeddings()(fmri_end)
+                    len_start, len_end = fmri_start.size(1), fmri_end.size(1)
+                    fmri_start_mask, fmri_end_mask = torch.tril(torch.ones(len_start, len_start)).unsqueeze(0).repeat(x_fmri.size(0), 1, 1).to(x_fmri.device), torch.tril(torch.ones(len_end, len_end)).unsqueeze(0).repeat(x_fmri.size(0), 1, 1).to(x_fmri.device)
+                    
+                    if not attention_mask_pre_combined:
+                        fmri_mask_with_delim = torch.vmap(torch.block_diag, in_dims=(0, 0, 0))(fmri_start_mask, fmri_mask_raw, fmri_end_mask)
+                        fmri_mask_with_delim[:, len_start:, :len_start] = 1
+                        fmri_mask_with_delim[:, -len_end:, :-len_end] = 1
+                        attention_mask = combine_attn_mask(fmri_mask_with_delim, text_mask_raw)
+                    else:
+                        # adjust attention_mask first
+                        fmri_mask = torch.vmap(torch.block_diag, in_dims=(0, 0, 0))(fmri_start_mask, attention_mask[:, :x_fmri.size(1), :x_fmri.size(1)], fmri_end_mask)
+                        fmri_mask[:, len_start:, :len_start] = 1
+                        fmri_mask[:, -len_end:, :-len_end] = 1
+                        attention_mask = combine_attn_mask(fmri_mask, attention_mask[:, x_fmri.size(1):, x_fmri.size(1):])
+                    
+                    # add the tag tokens to x_fmri and adjust y_fmri
+                    x_fmri = torch.cat([fmri_start.repeat(x_fmri.size(0), 1, 1), x_fmri, fmri_end.repeat(x_fmri.size(0), 1, 1)], dim=1)
+                    if y_fmri is not None: y_fmri = torch.cat([torch.full((y_fmri.size(0), len_start), -1 - self.original_vocab_size, dtype=y_fmri.dtype).to(y_fmri.device), y_fmri, torch.full((y_fmri.size(0), len_end), -1 - self.original_vocab_size, dtype=y_fmri.dtype).to(y_fmri.device)], dim=1)
+                    
+                    # adjust pos_ids
+                    pos_ids += len_start
+                    pos_ids = torch.cat([torch.arange(0, len_start, dtype=torch.long).to(x_fmri.device), 
+                                         pos_ids, 
+                                         torch.arange(pos_ids.max()+1, pos_ids.max()+1+len_end, dtype=torch.long).to(x_fmri.device)], 
+                                         dim=-1)
+                elif not attention_mask_pre_combined:
+                    # No delimiter, but masks passed separately — combine them here
+                    attention_mask = combine_attn_mask(fmri_mask_raw, text_mask_raw)
+
+                text_pos_ids = torch.arange(0, x_text_embeds.size(1), dtype=torch.long).to(x_fmri.device)
+                pos_ids = torch.cat([pos_ids, text_pos_ids + pos_ids.max() + 1], dim=-1)
+                pos_ids = pos_ids.unsqueeze(0).expand(x_fmri.shape[0], -1)  # (batch_size, seq_len)
+
+                # Concatenate: [fMRI_tokens] + [text_tokens]
+                x = torch.cat([x_fmri, x_text_embeds], dim=1)
+                
+                assert attention_mask is not None and attention_mask.ndim == 3, "Must provide a 3D attention_mask for multimodal input"
+                attention_mask = attention_mask.unsqueeze(1)
+                
+                self._interleave_prefix_len = 0  # no interleaving
+
+                if y_fmri is None and y_text is None:
+                    targets = None
+                elif y_fmri == 'nan' and y_text == 'nan':
+                    targets = 'nan'
+                else:
+                    y_fmri = y_fmri + self.original_vocab_size
+                    assert y_fmri.max() == -1, "No loss should be computed on fMRI tokens during instruction tuning"
+                    targets = torch.cat((y_fmri, y_text), dim=-1)
         else:
             raise ValueError("Must provide at least one input type (x_fmri or x_text)")
         
@@ -420,6 +596,8 @@ class MultimodalLLM(nn.Module):
         device = x.device
 
         # Calculate actual fMRI length after _prepare_inputs (includes delimiters if enabled)
+        # Also account for interleaving: fMRI may start at prefix_len instead of 0
+        interleave_prefix_len = getattr(self, '_interleave_prefix_len', 0)
         if x_fmri is not None and x_text is not None:
             if self.config.add_fmri_delimiter:
                 # Delimiters were added in _prepare_inputs
@@ -428,8 +606,11 @@ class MultimodalLLM(nn.Module):
                 actual_fmri_len = original_fmri_len + fmri_start_len + fmri_end_len
             else:
                 actual_fmri_len = original_fmri_len
+            # Non-text region length: prefix text tokens + fMRI tokens (these shouldn't be shifted)
+            non_text_prefix_len = interleave_prefix_len + actual_fmri_len
         else:
             actual_fmri_len = 0
+            non_text_prefix_len = 0
 
         # Handle case when prompt is right-padded; move the padding to the left of fMRI
         # Note: _prepare_inputs already handled delimiters and created the correct mask structure
@@ -446,12 +627,13 @@ class MultimodalLLM(nn.Module):
                 shifted_indices = (indices - pad_len.unsqueeze(1)) % x.shape[1]
                 x = torch.gather(x, 1, shifted_indices.unsqueeze(-1).expand_as(x))
 
-                # Update pos_ids using the actual fMRI length (including delimiters)
-                pos_mask = torch.arange(x_text.shape[1], device=device).unsqueeze(0).expand(batch_size, -1)
-                pos_mask = pos_mask > last_non_pad_idx.unsqueeze(1)
-                masked_pos_ids = pos_ids[:, actual_fmri_len:].masked_fill(pos_mask, 0)
+                # Zero out pos_ids for padding positions (always at the end before shift)
+                # This works for both interleaved [prefix, fMRI, suffix_valid, suffix_pad]
+                # and original [fMRI, text_valid, text_pad] orderings
+                pad_pos_mask = torch.arange(x.shape[1], device=device).unsqueeze(0).expand(batch_size, -1)
+                pad_pos_mask = pad_pos_mask >= (x.shape[1] - pad_len.unsqueeze(1))
                 pos_ids = pos_ids.clone()
-                pos_ids[:, actual_fmri_len:] = masked_pos_ids
+                pos_ids = pos_ids.masked_fill(pad_pos_mask, 0)
                 pos_ids = torch.gather(pos_ids, 1, shifted_indices)
                 
                 # Shift the attention mask in both dimensions (rows and columns). This maintains the attention pattern while moving padding to the left

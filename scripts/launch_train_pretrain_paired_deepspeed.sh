@@ -39,7 +39,7 @@ accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$C
  --epochs=30 \
  --desc_type=fc,ica \
  --dataset_dir=data/UKB/fmri/TianS3/ \
- --cfg_path=configs/vit_base_p160.yaml \
+ --cfg_path=configs/vit_base_p160_newTok.yaml \
  --lm_name=Qwen/Qwen3-0.6B \
  --text_only_weight=0.1 \
  --quantizer=vq \

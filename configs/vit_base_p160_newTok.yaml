@@ -1,0 +1,59 @@
+model:
+    num_rois: 450
+    num_timestamp: 160
+
+    token_size: 128
+    vit_enc_patch_size: 160
+    vit_enc_model_size: base
+    quantize_mode: vq
+
+    vit_dec_patch_size: 160
+    vit_dec_model_size: base
+    
+    # vq hyperparameters
+    codebook_size: 8192
+    commitment_cost: 0.25
+    use_l2_norm: false
+
+    # vit hyperparameters
+    add_cls_token: false
+    drop_path_rate: 0.1
+    mlp_ratio: 4.
+    qkv_bias: true
+    qk_scale: null
+    qk_norm: false
+    proj_bias: true
+    drop_rate: 0.
+    attn_drop_rate: 0.
+    attn_mode: flash_attn
+    attn_causal: false
+    gate_attn: none
+
+    rope_mode: headwise
+
+lm:
+    base_model: null  # will be set in the training script
+    num_fmri_tokens: 450
+    fmri_vocab_size: 8192  # for vq
+    dropout: 0.0
+    num_rois: 450
+    use_fmri_lm_head: false  # use a seperate head for fMRI LM loss
+    add_fmri_delimiter: true # add fmri_start and fmri_end to the input sequence
+
+    # instruction tuning
+    peft_tune: true
+    use_cls_head: false
+    freeze_pretrained_lora: false  # add a new lora module
+
+    # LoRA hyperparameters
+    lora_r: 1
+    lora_alpha: 1
+    lora_dropout: 0.1
+    lora_target_modules:
+    - q_proj
+    - k_proj
+
+    # QWEN-recommended inference hyperparameters
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20

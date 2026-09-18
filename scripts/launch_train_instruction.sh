@@ -46,7 +46,7 @@ export TOKENIZERS_PARALLELISM=false
 accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR --main_process_port=$MASTER_PORT --mixed_precision=bf16 train_instruction.py \
  --ckpt_dir=checkpoints/instruction/UKB-robust/Qwen3-0.6B \
  --wandb_group=pretrained \
- --cfg_path=configs/vit_base_p160.yaml \
+ --cfg_path=configs/vit_base_p160_newTok.yaml \
  --gradient_accumulation_steps=8 \
  --epochs=30 \
  --quantizer=vq \

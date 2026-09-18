@@ -34,7 +34,7 @@ accelerate launch --num_processes=$NUM_GPUS --num_machines=$COUNT_NODE --main_pr
  --dataset_dir=data/UKB/fmri/TianS3/ \
  --wandb_runname=UKB_robust-VQ_Align-ViT_base-p160 \
  --quantizer=vq \
- --cfg_path=configs/vit_base_p160.yaml \
+ --cfg_path=configs/vit_base_p160_newTok.yaml \
  --ckpt_dir=./checkpoints/tokenizer/UKB_robust-VQ-ViT_base-p160 \
  --domain_loss_weight=1 \
  --lm_name=gpt2 \
